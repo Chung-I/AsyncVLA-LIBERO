@@ -12,15 +12,23 @@
 Please set up a conda environment (see instructions in [SETUP.md](SETUP.md)).
 
 ### Inference
-1. Download our checkpoints and place them in our directory. 
+1. Download our repositories. (You need to download another repository of our previous project to define our entire model.)
     ```
+    git clone https://github.com/NHirose/AsyncVLA.git
+    git clone https://github.com/NHirose/Learning-to-Drive-Anywhere-with-MBRA.git
+    ```
+
+2. Download our checkpoints and place them in our directory, AsyncVLA. 
+    ```
+    cd AsyncVLA
     git clone https://huggingface.co/NHirose/AsyncVLA_release
     ```
-2. Run AsyncVLA using sample current images and 2D goal pose. You can view the generated trajectories in the output figure visualization_asyncvla.jpg. (Run BaseVLA and Edge adapter in same PC)
+3. Run AsyncVLA using sample current images and 2D goal pose. You can view the generated trajectories in the output figure visualization_asyncvla.jpg. (Run BaseVLA and Edge adapter in same PC)
     ```
+    cd ..
     python inference/run_asyncvla.py
     ```   
-3. Run AsyncVLA to control the real robot. We split the AsyncVLA into the base VLA and the edge adapter. Then we run the base VLA in the remote workstation and run the edge adapter in the robot edge controller with ROS1. Details are shown in the paper appendix. 
+4. Run AsyncVLA to control the real robot. We split the AsyncVLA into the base VLA and the edge adapter. Then we run the base VLA in the remote workstation and run the edge adapter in the robot edge controller with ROS1. Details are shown in the paper appendix. 
 
 ### Datasets
 We provide training code that supports multiple public datasets. Before following the full training process, please first ensure that you can run the example training with the sample dataloader.
@@ -38,15 +46,11 @@ In our training setup, we use 5 Nvidia H200 GPUs (140 GB each) across 5 nodes. T
 ### Training
 We provide the training code along with a sample dataloader to help you quickly understand the required data loading structure. Since preparing the full training dataset is resource-intensive, we include this simplified code base for convenience.
 
-1. Downloading MBRA project code base:
-    ```
-    git clone https://github.com/NHirose/Learning-to-Drive-Anywhere-with-MBRA.git
-    ```
-2. You can set the training mode at line 10 and 11 in vla-scripts/train_asyncvla.py.
+1. You can set the training mode at line 10 and 11 in vla-scripts/train_asyncvla.py.
 
-3. You can configure visualization at line 12 in vla-scripts/train_asyncvla.py. During training, it should be set to False.
+2. You can configure visualization at line 12 in vla-scripts/train_asyncvla.py. During training, it should be set to False.
     
-4. Training our policy from AsyncVLA checkpoints (Please fill X):
+3. Training our policy from AsyncVLA checkpoints (Please fill X):
     ```
     torchrun --standalone --nnodes 1 --nproc-per-node X vla-scripts/train_asyncvla.py  --vla_path ./AsyncVLA_release --dataset_name asyncvla --wandb_entity "X"   --wandb_project "asyncvla" --grad_accumulation_steps X
     ```
