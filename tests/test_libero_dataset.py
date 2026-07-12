@@ -4,7 +4,7 @@ import torch
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK
 
 
-def test_libero_sample_shapes(tmp_path):
+def test_libero_sample_shapes():
     from prismatic.vla.datasets.libero_dataset import LiberoSpatialDataset
 
     ds = LiberoSpatialDataset(split="train", max_samples=4)  # small/dummy-safe
@@ -27,13 +27,47 @@ def test_libero_first_frame_past_equals_obs():
 
 
 def test_libero_pixel_values_has_two_images():
-    """`pixel_values` must channel-stack agentview + wrist (2 images) for the frozen base."""
+    """`pixel_values` must channel-stack agentview + wrist (2 images) for the frozen base.
+
+    The fused dinosiglip vision backbone encodes each image as 6 channels (3 from DINOv2 +
+    3 from SigLIP), so 2 images -> exactly 12 channels. Assert the exact count, not just
+    evenness, so a regression to a single-image encoding (6 channels) or a third image would
+    be caught.
+    """
     from prismatic.vla.datasets.libero_dataset import LiberoSpatialDataset
 
     ds = LiberoSpatialDataset(split="train", max_samples=1)
     item = ds[0]
-    # Fused vision backbone: each image occupies `pixel_values.shape[0] // 2` channels.
-    assert item["pixel_values"].shape[0] % 2 == 0
+    assert item["pixel_values"].shape[0] == 12
+
+
+def test_libero_gt_action_chunk_gripper_is_standardized():
+    """`gt_action_chunk`'s gripper dim (index 6) must reflect the OXE `libero_dataset_transform`
+    standardization (clip to [0, 1], then invert: +1 = open, 0 = close) applied to the raw
+    RLDS action BEFORE tokenization/normalization -- not the raw {-1, +1} LIBERO convention
+    the tfrecords store directly.
+
+    The checkpoint's `dataset_statistics.json` gives this dim q01=min=0, q99=max=1, so
+    BOUNDS_Q99-normalizing the *standardized* gripper value (0 or 1) lands at -1 or +1 --
+    i.e. the normalized value can reach +1 (open) but, once correctly standardized, can never
+    go below 0 pre-normalization and so never lands below -1 - eps post-normalization. The raw,
+    un-standardized tfrecord convention for this real sample's first NUM_ACTIONS_CHUNK steps is
+    a constant -1 (raw "open"), which -- fed through the SAME q01=0/q99=1 normalizer without the
+    transform -- would incorrectly clip to -1 (post-normalization "close"). So checking the
+    normalized value lands at +1 (within [-0.01, 1.01], not the raw-bug value of -1) directly
+    catches a missing/incorrect standardization.
+    """
+    from prismatic.vla.datasets.libero_dataset import DEFAULT_DATA_DIR, LiberoSpatialDataset, _has_tfrecords
+
+    if not _has_tfrecords(DEFAULT_DATA_DIR):
+        pytest.skip("real local RLDS shard not present; this test requires it")
+
+    ds = LiberoSpatialDataset(split="train", max_samples=4)
+    item = ds[0]
+    gripper = item["gt_action_chunk"][:, 6]
+
+    assert torch.all(gripper >= -0.01) and torch.all(gripper <= 1.01)
+    assert not torch.allclose(gripper, torch.full_like(gripper, -1.0))
 
 
 def test_collate_libero_batch_stacks_fields():

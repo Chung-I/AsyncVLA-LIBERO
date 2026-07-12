@@ -89,6 +89,26 @@ def _to_edge_frame(img: Image.Image) -> torch.Tensor:
     return _edge_normalize(frame)
 
 
+def _apply_libero_action_transform(action_chunk_raw: np.ndarray) -> np.ndarray:
+    """Numpy port of `prismatic/vla/datasets/rlds/oxe/transforms.py::libero_dataset_transform`
+    (the OXE standardization transform registered for `libero_spatial_no_noops` in
+    `OXE_STANDARDIZATION_TRANSFORMS`), applied to a raw `[T, ACTION_DIM]` action chunk read
+    directly from the RLDS tfrecords.
+
+    That transform only touches the action's gripper dim (index 6): raw LIBERO gripper
+    actions are in [-1 (open), 1 (close)]; the transform clips to [0, 1] then inverts
+    (`invert_gripper_actions`, i.e. `1 - x`) so the standardized convention is
+    +1 = open, 0 = close -- matching the frozen checkpoint's `dataset_statistics.json`
+    (dim 6: min=0, max=1). It does NOT touch the other 6 action dims, and its only effect
+    on `observation` is renaming/re-slicing `state` into `EEF_state`/`gripper_state`
+    (no value changes), which this dataset does not use (proprio here is the raw state
+    concat, already verified correct).
+    """
+    action_chunk = action_chunk_raw.copy()
+    action_chunk[:, 6] = 1.0 - np.clip(action_chunk[:, 6], 0.0, 1.0)
+    return action_chunk
+
+
 def _bounds_q99_normalize(x: np.ndarray, stats: Dict[str, Any]) -> np.ndarray:
     """Numpy port of the BOUNDS_Q99 branch of
     `prismatic/vla/datasets/rlds/utils/data_utils.py::normalize_action_and_proprio`
@@ -310,6 +330,9 @@ class LiberoSpatialDataset(Dataset):
         proprio = _bounds_q99_normalize(proprio_raw, self._proprio_stats) if self._proprio_stats else proprio_raw
 
         action_chunk_raw = np.stack(ep["action"][t : t + NUM_ACTIONS_CHUNK]).astype(np.float32)
+        # Replicate the OXE `libero_dataset_transform` standardization (gripper convention
+        # fix) that the frozen checkpoint was trained through, BEFORE normalization/tokenization.
+        action_chunk_raw = _apply_libero_action_transform(action_chunk_raw)
         action_chunk = (
             _bounds_q99_normalize(action_chunk_raw, self._action_stats) if self._action_stats else action_chunk_raw
         )
