@@ -17,6 +17,9 @@ runs/
 **/__pycache__/
 # Ignore all wandb directories everywhere
 **/wandb/
+# Phase-1 env: local uv venv and egg-info (see docs/superpowers/notes/phase1-env.md)
+.venv/
+*.egg-info/
 AsyncVLA_release/
 AsyncVLA_v0/
 inference/run_asyncvla_.py

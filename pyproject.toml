@@ -44,16 +44,28 @@ dependencies = [
     "rich",
     "sentencepiece==0.1.99",
     "timm==0.9.10",
-    "tokenizers==0.19.1",
-    "torch==2.2.0",
-    "torchvision==0.17.0",
-    "torchaudio==2.2.0",
-    "transformers @ git+https://github.com/moojink/transformers-openvla-oft.git",  # IMPORTANT: Use this fork for bidirectional attn (for parallel decoding)
+    "tokenizers>=0.19.1",
+    # NOTE (Phase-1 env, RTX 5090 / Blackwell sm_120): the upstream pins below (torch==2.2.0,
+    # torchvision==0.17.0, torchaudio==2.2.0) cannot drive a Blackwell GPU. Relaxed to floors so
+    # `pip install -e .` does not clobber the Blackwell-capable torch==2.11.0+cu128 installed
+    # separately from https://download.pytorch.org/whl/cu128. See docs/superpowers/notes/phase1-env.md.
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "torchaudio>=2.2.0",
+    # NOTE: upstream pins a git fork (moojink/transformers-openvla-oft) for bidirectional attn.
+    # That fork is pinned to old torch/tokenizers internals and did not resolve cleanly against
+    # torch 2.11 in this environment; relaxed to a released version compatible with OpenVLA-OFT
+    # remote code for this dev box. See docs/superpowers/notes/phase1-env.md for the exact
+    # resolved version and any follow-up needed to restore bidirectional-attn behavior.
+    "transformers>=4.40.1,<4.48",
     "wandb",
-    "tensorflow==2.15.0",
-    "tensorflow_datasets==4.9.3",
-    "tensorflow_graphics==2021.12.3",
-    "dlimp @ git+https://github.com/moojink/dlimp_openvla",
+    # NOTE: tensorflow==2.15.0 / tensorflow_graphics==2021.12.3 / dlimp (git) are RLDS/training-only
+    # deps with no compatible wheels for this Python 3.10 + numpy 2.x env; relaxed/deferred, see notes.
+    "tensorflow>=2.15.0",
+    "tensorflow_datasets>=4.9.3",
+    # NOTE: diffusers is only referenced in a commented-out import (prismatic/models/action_heads.py);
+    # newer diffusers hard-require peft>=0.15 which conflicts with the OpenVLA-OFT peft==0.11.1 pin.
+    # Kept at the upstream 0.11.1 to avoid the conflict. See docs/superpowers/notes/phase1-env.md.
     "diffusers==0.11.1",
     "imageio",
     "uvicorn",
