@@ -242,3 +242,66 @@ class Proj_Actiontokens(nn.Module):
         rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
         action = self.model(rearranged_actions_hidden_states, taskid)
         return action
+
+class Edge_adapter_manip(nn.Module):
+    """AsyncVLA Edge Adapter retargeted for manipulation: predicts an
+    (NUM_ACTIONS_CHUNK x action_dim) action chunk instead of 2D waypoints."""
+    def __init__(
+        self,
+        obs_encoding_size: Optional[int] = 512,
+        mha_num_attention_heads: Optional[int] = 2,
+        mha_num_attention_layers: Optional[int] = 2,
+        mha_ff_dim_factor: Optional[int] = 4,
+        action_dim: int = ACTION_DIM,
+    ) -> None:
+        super().__init__()
+        self.obs_encoding_size = obs_encoding_size
+        self.action_dim = action_dim
+
+        self.cat_encoder = EfficientNet.from_name("efficientnet-b0", in_channels=6)
+        self.num_cat_features = self.cat_encoder._fc.in_features
+        self.obs_encoder = EfficientNet.from_name("efficientnet-b0", in_channels=3)
+        self.num_obs_features = self.obs_encoder._fc.in_features
+
+        self.compress_obs_enc = (
+            nn.Linear(self.num_obs_features, self.obs_encoding_size)
+            if self.num_obs_features != self.obs_encoding_size else nn.Identity()
+        )
+        self.compress_cat_enc = (
+            nn.Linear(self.num_cat_features, self.obs_encoding_size)
+            if self.num_cat_features != self.obs_encoding_size else nn.Identity()
+        )
+
+        self.decoder = MultiLayerDecoder_trans(
+            embed_dim=self.obs_encoding_size,
+            seq_len=NUM_ACTIONS_CHUNK + 1 + 1,
+            output_layers=[256, 128, 64, 32],
+            nhead=mha_num_attention_heads,
+            num_layers=mha_num_attention_layers,
+            ff_dim_factor=mha_ff_dim_factor,
+        )
+        self.action_predictor = nn.Sequential(
+            nn.Linear(self.obs_encoding_size, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, NUM_ACTIONS_CHUNK * action_dim),
+        )
+
+    def forward(self, obs_img, past_img, vla_feature):
+        batch_size = obs_img.shape[0]
+        cat_img = torch.cat((obs_img, past_img), dim=1)
+        cat_encoding = self.cat_encoder.extract_features(cat_img)
+        cat_encoding = self.cat_encoder._avg_pooling(cat_encoding).flatten(start_dim=1)
+        cat_encoding = self.compress_cat_enc(cat_encoding)
+
+        obs_encoding = self.obs_encoder.extract_features(obs_img)
+        obs_encoding = self.obs_encoder._avg_pooling(obs_encoding).flatten(start_dim=1)
+        obs_encoding = self.compress_obs_enc(obs_encoding)
+
+        tokens = torch.cat(
+            (vla_feature, obs_encoding.unsqueeze(1), cat_encoding.unsqueeze(1)), dim=1
+        )
+        tokens = self.decoder(tokens)[:, -2:-1, :]
+        x = tokens.reshape(tokens.shape[0], -1)
+        action_pred = self.action_predictor(x).reshape(batch_size, NUM_ACTIONS_CHUNK, self.action_dim)
+        return action_pred
