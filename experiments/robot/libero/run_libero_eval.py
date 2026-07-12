@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import tqdm
+import wandb
 from libero.libero import benchmark
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
@@ -209,6 +210,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env_img_res", type=int, default=256, help="LIBERO env camera resolution.")
     parser.add_argument("--no_center_crop", action="store_true", help="Disable center-crop image preprocessing.")
     parser.add_argument("--no_save_video", action="store_true", help="Skip saving MP4 rollout videos.")
+    parser.add_argument("--use_wandb", type=lambda x: str(x).lower() not in ("false", "0", "no"),
+                         default=True, help="Log results to Weights & Biases (default: True).")
+    parser.add_argument("--wandb_project", type=str, default="asyncvla-libero",
+                         help="W&B project name (used when --use_wandb is set).")
     return parser.parse_args()
 
 
@@ -217,6 +222,10 @@ def main():
     assert args.mode == "stock", f"Only --mode stock is implemented (Task 3.1); got {args.mode!r}."
 
     set_seed_everywhere(args.seed)
+
+    if args.use_wandb:
+        run_name = f"{args.mode}-{args.task_suite_name}-{args.num_trials_per_task}trials"
+        wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
     # --- Load frozen base (Task 2.1 interface) + native action head ---
     base_cfg = StockEvalConfig(
@@ -310,11 +319,22 @@ def main():
         task_sr = task_successes / task_episodes if task_episodes > 0 else 0.0
         logger.info(f"Task {task_id} ({task_description}) success rate: {task_sr:.4f}")
 
+        if args.use_wandb:
+            task_name_slug = "".join(c if c.isalnum() else "_" for c in task_description).strip("_").lower()
+            wandb.log({f"{args.mode}/sr_task_{task_id}_{task_name_slug}": task_sr})
+
     final_sr = total_successes / total_episodes if total_episodes > 0 else 0.0
     logger.info("Final results:")
     logger.info(f"Total episodes: {total_episodes}")
     logger.info(f"Total successes: {total_successes}")
     logger.info(f"Overall success rate: {final_sr:.4f} ({final_sr * 100:.1f}%)")
+
+    if args.use_wandb:
+        wandb.log({f"{args.mode}/sr_overall": final_sr})
+        wandb.summary[f"{args.mode}/sr_overall"] = final_sr
+        wandb.summary["total_episodes"] = total_episodes
+        wandb.summary["total_successes"] = total_successes
+        wandb.finish()
 
     return final_sr
 
