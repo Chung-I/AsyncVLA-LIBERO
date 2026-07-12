@@ -32,26 +32,6 @@ import torch
 import tqdm
 from libero.libero import benchmark
 
-# --- torch>=2.6 compatibility shim ---
-# `benchmark.get_task_init_states` calls plain `torch.load(init_states_path)` on
-# LIBERO's own bundled `.pruned_init` files (numpy object arrays pickled with an
-# older torch/numpy). Since PyTorch 2.6, `torch.load`'s default `weights_only`
-# flipped True->False is now True, which rejects the `numpy.core.multiarray._reconstruct`
-# global these files use and raises `UnpicklingError`. This is a real integration
-# point surfaced during Task 3.1's smoke run, not a stock-eval code path we can
-# change (LIBERO is an installed, unmodified dependency). These are local,
-# trusted files bundled with the LIBERO install, so restoring the old default is
-# safe here.
-_torch_load = torch.load
-
-
-def _torch_load_weights_only_false(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _torch_load(*args, **kwargs)
-
-
-torch.load = _torch_load_weights_only_false
-
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
@@ -170,7 +150,7 @@ def run_episode(
     env.reset()
     obs = env.set_init_state(initial_state)
 
-    action_queue = deque()
+    action_queue = deque(maxlen=8)
     t = 0
     replay_images = []
     success = False
@@ -216,7 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stock OpenVLA-OFT LIBERO-Spatial eval harness.")
     parser.add_argument("--mode", type=str, default="stock", choices=["stock"],
                         help="Eval mode. Only 'stock' (native base action prediction) is implemented.")
-    parser.add_argument("--task_suite", type=str, default="libero_spatial",
+    parser.add_argument("--task_suite_name", type=str, default="libero_spatial",
                          choices=list(TASK_MAX_STEPS.keys()), help="LIBERO task suite name.")
     parser.add_argument("--num_trials_per_task", type=int, default=50, help="Number of rollouts per task.")
     parser.add_argument("--num_tasks", type=int, default=None,
@@ -257,7 +237,7 @@ def main():
     action_head.eval()
 
     # Resolve the unnorm_key (task suite name, with "_no_noops" fallback).
-    unnorm_key = args.task_suite
+    unnorm_key = args.task_suite_name
     if unnorm_key not in vla.norm_stats and f"{unnorm_key}_no_noops" in vla.norm_stats:
         unnorm_key = f"{unnorm_key}_no_noops"
     assert unnorm_key in vla.norm_stats, (
@@ -270,17 +250,38 @@ def main():
 
     # --- Initialize LIBERO task suite ---
     benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[args.task_suite]()
+    task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks = task_suite.n_tasks if args.num_tasks is None else min(args.num_tasks, task_suite.n_tasks)
-    max_steps = TASK_MAX_STEPS[args.task_suite]
+    max_steps = TASK_MAX_STEPS[args.task_suite_name]
 
-    logger.info(f"Task suite: {args.task_suite} | running {num_tasks}/{task_suite.n_tasks} tasks, "
+    logger.info(f"Task suite: {args.task_suite_name} | running {num_tasks}/{task_suite.n_tasks} tasks, "
                 f"{args.num_trials_per_task} trial(s)/task")
 
     total_episodes, total_successes = 0, 0
     for task_id in range(num_tasks):
         task = task_suite.get_task(task_id)
-        initial_states = task_suite.get_task_init_states(task_id)
+        # --- torch>=2.6 compatibility shim (scoped to LIBERO init-state load) ---
+        # `benchmark.get_task_init_states` calls plain `torch.load(init_states_path)` on
+        # LIBERO's own bundled `.pruned_init` files (numpy object arrays pickled with an
+        # older torch/numpy). Since PyTorch 2.6, `torch.load`'s default `weights_only`
+        # flipped True->False is now True, which rejects the `numpy.core.multiarray._reconstruct`
+        # global these files use and raises `UnpicklingError`. This is a real integration
+        # point surfaced during Task 3.1's smoke run, not a stock-eval code path we can
+        # change (LIBERO is an installed, unmodified dependency). These are local,
+        # trusted files bundled with the LIBERO install, so restoring the old default is
+        # safe here.
+        _torch_load_orig = torch.load
+
+        def _torch_load_weights_only_false(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return _torch_load_orig(*args, **kwargs)
+
+        try:
+            torch.load = _torch_load_weights_only_false
+            initial_states = task_suite.get_task_init_states(task_id)
+        finally:
+            torch.load = _torch_load_orig
+
         env, task_description = get_libero_env(task, "openvla", resolution=args.env_img_res)
 
         task_episodes, task_successes = 0, 0
