@@ -44,7 +44,8 @@ dependencies = [
     "rich",
     "sentencepiece==0.1.99",
     "timm==0.9.10",
-    "tokenizers>=0.19.1",
+    # Pinned <0.20 for the OpenVLA-OFT transformers fork (4.40.1). See transformers note below.
+    "tokenizers>=0.19.1,<0.20",
     # NOTE (Phase-1 env, RTX 5090 / Blackwell sm_120): the upstream pins below (torch==2.2.0,
     # torchvision==0.17.0, torchaudio==2.2.0) cannot drive a Blackwell GPU. Relaxed to floors so
     # `pip install -e .` does not clobber the Blackwell-capable torch==2.11.0+cu128 installed
@@ -52,12 +53,16 @@ dependencies = [
     "torch>=2.2.0",
     "torchvision>=0.17.0",
     "torchaudio>=2.2.0",
-    # NOTE: upstream pins a git fork (moojink/transformers-openvla-oft) for bidirectional attn.
-    # That fork is pinned to old torch/tokenizers internals and did not resolve cleanly against
-    # torch 2.11 in this environment; relaxed to a released version compatible with OpenVLA-OFT
-    # remote code for this dev box. See docs/superpowers/notes/phase1-env.md for the exact
-    # resolved version and any follow-up needed to restore bidirectional-attn behavior.
-    "transformers>=4.40.1,<4.48",
+    # REQUIRED: the moojink/transformers-openvla-oft fork (transformers 4.40.1) implements the
+    # BIDIRECTIONAL (non-causal) attention over action tokens that OpenVLA-OFT parallel decoding
+    # was trained with. Stock transformers uses causal attention -> train/inference mismatch ->
+    # depressed LIBERO SR (measured: 0.61 with stock 4.47.1 vs ~0.9+ with the fork). On this
+    # Blackwell/torch-2.11 box the fork's own deps don't resolve, so install it WITHOUT deps:
+    #   uv pip install --python .venv/bin/python --no-deps --reinstall-package transformers \
+    #     "transformers @ git+https://github.com/moojink/transformers-openvla-oft.git"
+    #   uv pip install --python .venv/bin/python "tokenizers>=0.19.1,<0.20"
+    # See docs/superpowers/notes/phase1-env.md.
+    "transformers @ git+https://github.com/moojink/transformers-openvla-oft.git",
     "wandb",
     # NOTE: tensorflow==2.15.0 / tensorflow_graphics==2021.12.3 / dlimp (git) are RLDS/training-only
     # deps with no compatible wheels for this Python 3.10 + numpy 2.x env; relaxed/deferred, see notes.

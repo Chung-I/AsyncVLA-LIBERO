@@ -192,3 +192,19 @@ uv pip install "robosuite==1.4.0" "mujoco==2.3.2" bddl easydict "hydra-core>=1.2
 # checkpoint:
 python -c "from huggingface_hub import snapshot_download; print(snapshot_download('moojink/openvla-7b-oft-finetuned-libero-spatial'))"
 ```
+
+## UPDATE (2026-07-12): restored OpenVLA-OFT transformers fork (bidirectional attention)
+
+**Why:** Stock `transformers==4.47.1` uses causal attention; OpenVLA-OFT parallel decoding was
+trained with BIDIRECTIONAL attention over action tokens (implemented by the fork). Symptom: stock
+LIBERO-Spatial topline SR = **0.61** (100 trials) vs published ~0.9+. Root cause documented in the
+checkpoint's own `modeling_prismatic.py:742` ("non-causal bi-directional self-attention").
+
+**Fix (keeps torch 2.11.0+cu128 / Blackwell):**
+```
+uv pip install --python .venv/bin/python --no-deps --reinstall-package transformers \
+  "transformers @ git+https://github.com/moojink/transformers-openvla-oft.git"
+uv pip install --python .venv/bin/python "tokenizers>=0.19.1,<0.20"
+```
+Result: transformers 4.40.1 (fork), tokenizers 0.19.1, torch 2.11.0+cu128 intact. Base loads with
+NO version-mismatch warning. SR recovery confirmed separately (see phase1-results.md).
