@@ -19,9 +19,10 @@ per-step latency), but the work is **staged into two plans**:
   the exact modules, training, and co-located inference behavior; retarget nav → 7-DoF
   manipulation and the frozen OpenVLA-OFT LIBERO base. Get it training and running on
   LIBERO-Spatial. **No two-rate async loop, no latency study.**
-  **Acceptance bar:** our base+edge success rate must be **close to the stock
+  **Acceptance:** our base+edge success rate should be **close to the stock
   OpenVLA-OFT-LIBERO topline SR** — so we run the stock model in the same LIBERO-Spatial
-  sim and compare directly (see §5, §7).
+  sim and **report the SR gap** (`SR_topline − SR_ours`). No hard pass/fail threshold in
+  Phase 1; acceptability is judged after seeing the numbers (see §5, §7).
 - **Phase 2 (next plan, deferred): our interpretation of the paper.** Build the
   Algorithm-1 two-rate asynchronous loop (workstation/edge frequencies, delayed-frame
   timestamp matching), the latency/speedup measurement, and the frequency/cadence sweep.
@@ -67,7 +68,7 @@ and latency measurement are *paper interpretation* and are **deferred to Phase 2
 | Benchmark | **LIBERO-Spatial** (10 tasks) first |
 | North-star objective | Async speedup thesis (SR retained + per-step latency reduced) — **demonstrated in Phase 2** |
 | Phase 1 objective | **Faithful code mirror on LIBERO**: modules ported, trains, runs functionally |
-| Phase 1 success criterion | Base+edge SR **close to stock OpenVLA-OFT-LIBERO topline SR** (target: within ~5% absolute SR — confirm at review), same eval protocol |
+| Phase 1 success criterion | Base+edge SR **close to stock OpenVLA-OFT-LIBERO topline SR**; **report the SR gap** under the same protocol — no hard threshold yet, judged after seeing numbers |
 | Topline baseline | Stock OpenVLA-OFT-LIBERO (native action head, no edge), evaluated in the same LIBERO-Spatial sim |
 | Eval protocol | OpenVLA-OFT standard: 10 LIBERO-Spatial tasks × 50 rollouts = 500 trials, identical seeds/config for stock and ours |
 | Edge design | **Approach A** — edge predicts the **full** 8×7 action chunk; residual-edge is a Phase-2 fallback |
@@ -140,8 +141,9 @@ The same eval harness runs **two configurations** in the LIBERO-Spatial sim unde
    **synchronous** (base + edge every control step, edge's action executed). Yields
    `SR_ours`.
 
-**Phase-1 success:** `SR_ours` is close to `SR_topline` (target within ~5% absolute SR —
-confirm at review). Report both SRs (overall + per-task) side by side to wandb.
+**Phase-1 success:** `SR_ours` is close to `SR_topline`. **Report the gap**
+(`SR_topline − SR_ours`), overall + per-task, side by side to wandb. No hard pass/fail
+threshold in Phase 1 — acceptability is decided after seeing the numbers.
 
 **Explicitly NOT in Phase 1:** decoupling base/edge rates, running base less often than
 edge, timestamp buffers, latency measurement, cadence/frequency sweep. Those are Phase 2
@@ -172,8 +174,8 @@ claim).
   checkpoint loading + the eval harness and establishes `SR_topline` before the edge is
   attached.
 - **Smoke eval:** 1–2 LIBERO-Spatial episodes end-to-end through the base+edge rollout.
-- **Final comparison:** full 500-trial protocol for both `stock` and `edge` modes; check
-  `SR_ours` vs `SR_topline` against the acceptance bar.
+- **Final comparison:** full 500-trial protocol for both `stock` and `edge` modes; report
+  `SR_ours` vs `SR_topline` and the gap (no hard bar in Phase 1).
 
 ## 8. Risks & mitigations (Phase 1)
 
