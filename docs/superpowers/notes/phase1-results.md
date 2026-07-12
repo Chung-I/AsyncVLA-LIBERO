@@ -143,3 +143,26 @@ async edge.
 **GATE PASSED** — base pipeline reproduces stock OpenVLA-OFT LIBERO-Spatial behavior. The
 official `SR_topline` for the report comes from the full 500-trial protocol on NCHC Nano4;
 this 50-trial local run validates the pipeline.
+
+## FINAL RESULTS — NCHC Nano4 (H200), full 500-trial protocol
+
+Frozen OpenVLA-OFT LIBERO-Spatial base + trainable Edge Adapter (`Edge_adapter_manip`,
+EfficientNet-B0 from scratch) + `Proj_Actiontokens` projector. 10 tasks × 50 trials = 500.
+Synchronous Phase-1 rollout (edge path differs from stock only in the action source).
+
+| Config | Success rate | Successes | Gap vs topline | Job |
+|---|---|---|---|---|
+| **Stock topline** (native OpenVLA-OFT head) | **0.982** | 491/500 | — | 179474 |
+| Ours — edge @ 10k steps | 0.966 | 483/500 | 0.016 | 179554 |
+| Ours — edge @ 25k steps | 0.964 | 482/500 | 0.018 | 179730 |
+| **Ours — edge @ 50k steps (best)** | **0.972** | 486/500 | **0.010** | 180141 |
+
+Training: 50k steps, batch 8, lr 1e-4, all ~432 LIBERO-Spatial episodes, frozen base,
+~2.7 it/s on 1×H200 (~5h). Checkpoints every 5k. wandb: wandb.ai/leon129506/asyncvla-libero.
+
+**Conclusion.** The AsyncVLA structure — a compact from-scratch edge adapter distilling the
+frozen base's action-token features + fresh camera frames — reproduces the full 7B base's
+LIBERO-Spatial success rate to within **1.0 percentage point** (0.972 vs 0.982), saturating
+by ~10k steps. Phase-1 objective met: the async base+edge structure transfers cleanly from
+navigation to LIBERO manipulation with near-topline task success. (Phase 2 — the two-rate
+asynchronous loop + latency/speedup study — remains future work per the spec.)
