@@ -71,13 +71,18 @@ class AsyncVLALiberoConfig:
     # Dataset
     data_root_dir: Optional[str] = None     # Local `modified_libero_rlds` dir; None -> dataset default
     split: str = "train"
+    episode_limit: int = 10_000             # Max RLDS episodes to load (LIBERO-Spatial has ~432; 10k = all).
+                                            #   NOTE: the dataset default is 2 (smoke-only) -- training MUST
+                                            #   pass a large limit or it trains on 2 episodes.
 
     # Training configuration
     batch_size: int = 8                     # Batch size per device
     learning_rate: float = 1e-4
     max_steps: int = 50_000
     save_freq: int = 5_000                  # Checkpoint saving frequency in steps
-    num_workers: int = 4
+    num_workers: int = 0                    # 0 = load in the main process. num_workers>0 forks AFTER the
+                                            #   frozen base + TensorFlow are initialized, which deadlocks
+                                            #   the DataLoader workers (classic fork-after-CUDA/TF hang).
 
     run_root_dir: Path = Path("runs_libero")  # Path to directory to store checkpoints
     run_id_note: Optional[str] = None
@@ -211,7 +216,9 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
     # Dataset / dataloader.
-    dataset = LiberoSpatialDataset(split=cfg.split, data_dir=cfg.data_root_dir, processor=processor)
+    dataset = LiberoSpatialDataset(
+        split=cfg.split, data_dir=cfg.data_root_dir, processor=processor, episode_limit=cfg.episode_limit
+    )
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=device_id, shuffle=True)
         shuffle = False
