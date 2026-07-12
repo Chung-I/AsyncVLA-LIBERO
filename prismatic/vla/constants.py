@@ -25,8 +25,8 @@ class NormalizationType(str, Enum):
 # Define constants for each robot platform
 OMNIVLA_CONSTANTS = {
     "NUM_ACTIONS_CHUNK": 8,
-    "ACTION_DIM": 4,
-    "POSE_DIM": 4,
+    "ACTION_DIM": 7,
+    "POSE_DIM": 7,
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
