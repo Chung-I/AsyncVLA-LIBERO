@@ -45,3 +45,42 @@ This is a 4-episode smoke number only (not statistically meaningful, not the gat
 it confirms per-task and overall SR are correctly computed and logged to wandb.
 
 wandb run: https://wandb.ai/leon129506/asyncvla-libero/runs/qmreehhx
+
+## Stock topline — reduced local sweep (RTX 5090, 100 trials)
+
+**Date:** 2026-07-12. **Run completed cleanly** (exit 0, 100/100 episodes, ~13 min wall-clock).
+
+This is a reduced local sweep (10 tasks x 10 trials = 100 trials, `--mode stock`,
+`libero_spatial`) run on the local RTX 5090 — **not** the full 500-trial gate, but a
+first real topline read.
+
+```
+MUJOCO_GL=egl .venv/bin/python -m experiments.robot.libero.run_libero_eval \
+  --mode stock --task_suite_name libero_spatial \
+  --num_trials_per_task 10 --num_tasks 10 \
+  --wandb_project asyncvla-libero
+```
+
+**Overall success rate: 0.6100 (61/100 successes, 100 episodes).**
+
+| task_id | task description | trials | SR |
+|---|---|---|---|
+| 0 | pick up the black bowl between the plate and the ramekin and place it on the plate | 10 | 0.7000 |
+| 1 | pick up the black bowl next to the ramekin and place it on the plate | 10 | 0.1000 |
+| 2 | pick up the black bowl from table center and place it on the plate | 10 | 1.0000 |
+| 3 | pick up the black bowl on the cookie box and place it on the plate | 10 | 1.0000 |
+| 4 | pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate | 10 | 0.4000 |
+| 5 | pick up the black bowl on the ramekin and place it on the plate | 10 | 0.4000 |
+| 6 | pick up the black bowl next to the cookie box and place it on the plate | 10 | 0.8000 |
+| 7 | pick up the black bowl on the stove and place it on the plate | 10 | 0.5000 |
+| 8 | pick up the black bowl next to the plate and place it on the plate | 10 | 0.9000 |
+| 9 | pick up the black bowl on the wooden cabinet and place it on the plate | 10 | 0.3000 |
+| **overall** | **(100-trial reduced local sweep)** | **100** | **0.6100** |
+
+wandb run: https://wandb.ai/leon129506/asyncvla-libero/runs/tvusfvhj
+(run name `stock-libero_spatial-10trials`)
+
+**Caveat vs. the gate:** 0.61 is well below the published OpenVLA-OFT LIBERO-Spatial
+topline (~0.9+). Per-task SRs are noisy at only 10 trials/task, but the aggregate gap is
+large enough to flag per the Task 3.2 sanity gate — if the full sweep confirms this, debug
+base loading / prompt / normalization before validating the edge against it.
