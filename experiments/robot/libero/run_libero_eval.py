@@ -13,8 +13,14 @@ chunk (open-loop, `num_open_loop_steps == NUM_ACTIONS_CHUNK == 8`), exactly as
 the reference harness does. This is the project's gate: proving the frozen
 base reproduces stock LIBERO behavior before any edge is attached.
 
-Only `--mode stock` is implemented in this task (Task 3.1). `--num_tasks` is
-an addition (not in the reference) to allow limiting how many of the task
+`--mode stock` was the only mode implemented in Task 3.1. Task 5.1 adds `--mode edge`:
+the SYNCHRONOUS (Phase-1) base -> projector -> edge action-chunk policy
+(`experiments.robot.libero.edge_policy.EdgePolicy`) is queried every 8th control step in
+place of `get_vla_action`, but the rollout loop (open-loop action queue, `process_action`
+gripper handling, requery cadence) is otherwise identical between modes -- only the action
+source differs. The two-rate async loop is Phase 2, not implemented here.
+
+`--num_tasks` is an addition (not in the reference) to allow limiting how many of the task
 suite's tasks are run, for smoke testing.
 """
 
@@ -34,6 +40,7 @@ import wandb
 from libero.libero import benchmark
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
+from experiments.robot.libero.edge_policy import EdgeEvalConfig, EdgePolicy, resolve_unnorm_key
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
@@ -134,22 +141,27 @@ def prepare_observation(obs, resize_size):
 
 
 def run_episode(
-    cfg: StockEvalConfig,
     env,
     task_description: str,
-    vla,
-    processor,
-    action_head,
-    proprio_projector,
+    action_fn,
+    policy_reset,
     resize_size,
     initial_state,
     num_steps_wait: int,
     max_steps: int,
 ):
     """Run a single open-loop episode: requery the policy every 8 steps
-    (NUM_ACTIONS_CHUNK), executing its native parallel-decoded action chunk."""
+    (NUM_ACTIONS_CHUNK), executing its parallel-decoded action chunk.
+
+    `action_fn(obs, observation, task_description) -> List[np.ndarray]` is the mode's
+    action source (`get_vla_action` for `--mode stock`, `EdgePolicy.act` for `--mode
+    edge`); `policy_reset()` is called once per episode (a no-op for stock, clears the
+    edge's 1-frame agentview history for edge) -- everything else (open-loop cadence,
+    `process_action` gripper handling, `num_steps_wait`) is identical between modes.
+    """
     env.reset()
     obs = env.set_init_state(initial_state)
+    policy_reset()
 
     action_queue = deque(maxlen=8)
     t = 0
@@ -166,17 +178,7 @@ def run_episode(
             replay_images.append(img)
 
             if len(action_queue) == 0:
-                actions = get_vla_action(
-                    cfg=cfg,
-                    vla=vla,
-                    processor=processor,
-                    obs=observation,
-                    task_label=task_description,
-                    action_head=action_head,
-                    proprio_projector=proprio_projector,
-                    noisy_action_projector=None,
-                    use_film=cfg.use_film,
-                )
+                actions = action_fn(obs, observation, task_description)
                 action_queue.extend(actions)
 
             action = action_queue.popleft()
@@ -195,8 +197,9 @@ def run_episode(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stock OpenVLA-OFT LIBERO-Spatial eval harness.")
-    parser.add_argument("--mode", type=str, default="stock", choices=["stock"],
-                        help="Eval mode. Only 'stock' (native base action prediction) is implemented.")
+    parser.add_argument("--mode", type=str, default="stock", choices=["stock", "edge"],
+                        help="Eval mode: 'stock' (native base action prediction) or 'edge' "
+                             "(synchronous base->projector->edge action-chunk policy, Phase-1).")
     parser.add_argument("--task_suite_name", type=str, default="libero_spatial",
                          choices=list(TASK_MAX_STEPS.keys()), help="LIBERO task suite name.")
     parser.add_argument("--num_trials_per_task", type=int, default=50, help="Number of rollouts per task.")
@@ -210,6 +213,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env_img_res", type=int, default=256, help="LIBERO env camera resolution.")
     parser.add_argument("--no_center_crop", action="store_true", help="Disable center-crop image preprocessing.")
     parser.add_argument("--no_save_video", action="store_true", help="Skip saving MP4 rollout videos.")
+    parser.add_argument("--edge_ckpt", type=str, default=None,
+                        help="Path to the `Edge_adapter_manip` checkpoint (`shead--<step>_checkpoint.pt`). "
+                             "Required for --mode edge.")
+    parser.add_argument("--proj_ckpt", type=str, default=None,
+                        help="Path to the `Proj_Actiontokens` checkpoint (`proj--<step>_checkpoint.pt`). "
+                             "Required for --mode edge.")
     parser.add_argument("--use_wandb", type=lambda x: str(x).lower() not in ("false", "0", "no"),
                          default=True, help="Log results to Weights & Biases (default: True).")
     parser.add_argument("--wandb_project", type=str, default="asyncvla-libero",
@@ -219,7 +228,9 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    assert args.mode == "stock", f"Only --mode stock is implemented (Task 3.1); got {args.mode!r}."
+    assert args.mode in ("stock", "edge"), f"Unknown --mode {args.mode!r}."
+    if args.mode == "edge":
+        assert args.edge_ckpt and args.proj_ckpt, "--edge_ckpt and --proj_ckpt are required for --mode edge."
 
     set_seed_everywhere(args.seed)
 
@@ -227,35 +238,69 @@ def main():
         run_name = f"{args.mode}-{args.task_suite_name}-{args.num_trials_per_task}trials"
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
-    # --- Load frozen base (Task 2.1 interface) + native action head ---
-    base_cfg = StockEvalConfig(
-        pretrained_checkpoint=args.pretrained_checkpoint,
-        use_film=False,
-        num_images_in_input=2,
-        use_proprio=True,
-        load_in_8bit=False,
-        load_in_4bit=False,
-        lora_rank=0,
-        center_crop=not args.no_center_crop,
-        use_l1_regression=True,
-        use_diffusion=False,
-    )
-    vla, processor, proprio_projector = build_frozen_base(base_cfg)
-    action_head = get_action_head(base_cfg, vla.llm_dim)
-    action_head.requires_grad_(False)
-    action_head.eval()
-
-    # Resolve the unnorm_key (task suite name, with "_no_noops" fallback).
-    unnorm_key = args.task_suite_name
-    if unnorm_key not in vla.norm_stats and f"{unnorm_key}_no_noops" in vla.norm_stats:
-        unnorm_key = f"{unnorm_key}_no_noops"
-    assert unnorm_key in vla.norm_stats, (
-        f"Action un-norm key {unnorm_key!r} not found in VLA norm_stats! Available: {list(vla.norm_stats.keys())}"
-    )
-    base_cfg.unnorm_key = unnorm_key
-    logger.info(f"Resolved unnorm_key={unnorm_key!r}")
-
     resize_size = OPENVLA_IMAGE_SIZE
+
+    if args.mode == "stock":
+        # --- Load frozen base (Task 2.1 interface) + native action head ---
+        base_cfg = StockEvalConfig(
+            pretrained_checkpoint=args.pretrained_checkpoint,
+            use_film=False,
+            num_images_in_input=2,
+            use_proprio=True,
+            load_in_8bit=False,
+            load_in_4bit=False,
+            lora_rank=0,
+            center_crop=not args.no_center_crop,
+            use_l1_regression=True,
+            use_diffusion=False,
+        )
+        vla, processor, proprio_projector = build_frozen_base(base_cfg)
+        action_head = get_action_head(base_cfg, vla.llm_dim)
+        action_head.requires_grad_(False)
+        action_head.eval()
+
+        unnorm_key = resolve_unnorm_key(vla, args.task_suite_name)
+        base_cfg.unnorm_key = unnorm_key
+        logger.info(f"Resolved unnorm_key={unnorm_key!r}")
+
+        def action_fn(obs, observation, task_description):
+            return get_vla_action(
+                cfg=base_cfg,
+                vla=vla,
+                processor=processor,
+                obs=observation,
+                task_label=task_description,
+                action_head=action_head,
+                proprio_projector=proprio_projector,
+                noisy_action_projector=None,
+                use_film=base_cfg.use_film,
+            )
+
+        def policy_reset():
+            pass
+
+    else:  # args.mode == "edge"
+        # --- Load frozen base + edge adapter + action-token projector (Task 5.1) ---
+        edge_cfg = EdgeEvalConfig(
+            pretrained_checkpoint=args.pretrained_checkpoint,
+            use_film=False,
+            num_images_in_input=2,
+            use_proprio=True,
+            load_in_8bit=False,
+            load_in_4bit=False,
+            lora_rank=0,
+            center_crop=not args.no_center_crop,
+        )
+        edge_policy = EdgePolicy(
+            edge_cfg, task_suite_name=args.task_suite_name, edge_ckpt=args.edge_ckpt, proj_ckpt=args.proj_ckpt,
+        )
+        logger.info(f"Resolved unnorm_key={edge_policy.unnorm_key!r}")
+
+        def action_fn(obs, observation, task_description):
+            return edge_policy.act(obs, task_description)
+
+        def policy_reset():
+            edge_policy.reset()
 
     # --- Initialize LIBERO task suite ---
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -299,7 +344,7 @@ def main():
             initial_state = initial_states[episode_idx]
 
             success, replay_images = run_episode(
-                base_cfg, env, task_description, vla, processor, action_head, proprio_projector,
+                env, task_description, action_fn, policy_reset,
                 resize_size, initial_state, args.num_steps_wait, max_steps,
             )
 
