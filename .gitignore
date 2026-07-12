@@ -20,6 +20,11 @@ runs/
 # Phase-1 env: local uv venv and egg-info (see docs/superpowers/notes/phase1-env.md)
 .venv/
 *.egg-info/
+
+# Phase-1 data: local (possibly partial) `modified_libero_rlds` RLDS download used by
+# `prismatic/vla/datasets/libero_dataset.py` (see docs/superpowers/notes/phase1-data.md).
+# ~113MB for a single shard; the full dataset is ~10GB. Never commit.
+data/
 AsyncVLA_release/
 AsyncVLA_v0/
 inference/run_asyncvla_.py
