@@ -37,6 +37,10 @@ import numpy as np
 import torch
 import tqdm
 import wandb
+
+# MUST precede any `libero`/robosuite import: robosuite opens a hardcoded /tmp/robosuite.log
+# FileHandler at import, which PermissionError-crashes on shared cluster nodes. See the module.
+from experiments.robot.libero import _robosuite_logpatch  # noqa: F401  (import for side effect)
 from libero.libero import benchmark
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base

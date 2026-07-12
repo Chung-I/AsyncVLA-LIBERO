@@ -16,6 +16,10 @@ import time
 
 import imageio
 import numpy as np
+
+# MUST precede any `libero`/robosuite import: robosuite opens a hardcoded /tmp/robosuite.log
+# FileHandler at import, which PermissionError-crashes on shared cluster nodes. See the module.
+from experiments.robot.libero import _robosuite_logpatch  # noqa: F401  (import for side effect)
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
