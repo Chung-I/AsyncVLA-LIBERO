@@ -25,7 +25,10 @@ torchrun/DDP required) that overfits ONE fixed real batch from `LiberoSpatialDat
 used by the `tests/test_train_overfit.py` slow integration test.
 """
 
-from __future__ import annotations
+# NOTE: do NOT add `from __future__ import annotations` here. It turns the
+# `cfg: AsyncVLALiberoConfig` type hint into a string that draccus 0.8.0's
+# `@draccus.wrap()` cannot resolve, so it calls `dataclasses.fields()` on the
+# string and raises "must be called with a dataclass type or instance".
 
 import os
 from collections import deque
