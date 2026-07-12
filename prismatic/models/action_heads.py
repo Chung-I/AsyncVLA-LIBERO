@@ -80,6 +80,44 @@ class MLPResNet(nn.Module):
         x = self.fc2(x)  # shape: (batch_size, output_dim)    
         return x
 
+class L1RegressionActionHead(nn.Module):
+    """Standard (non-idcat) MLP-based action head that generates continuous actions via L1 regression.
+
+    Ported verbatim from the stock `moojink/openvla-oft` reference
+    (`experiments/robot/openvla_utils.py` in that repo has an identical
+    class defined in `prismatic/models/action_heads.py`). This is the
+    architecture used by the released `openvla-7b-oft-finetuned-libero-spatial`
+    checkpoint's `action_head--150000_checkpoint.pt` (verified: its
+    `model.fc1.weight` is `[4096, 28672]` == `[hidden_dim, input_dim*ACTION_DIM]`
+    with `ACTION_DIM=7`, and `model.fc2.weight` is `[7, 4096]`). This differs
+    from `L1RegressionActionHead_idcat` above (which is this repo's
+    OmniVLA-specific variant that additionally conditions on a `taskid`) --
+    the stock LIBERO checkpoint's `predict_action` call site in
+    `modeling_prismatic.py` calls `action_head.predict_action(actions_hidden_states)`
+    with no `taskid`, so it needs this plain variant, not the idcat one.
+    """
+    def __init__(
+        self,
+        input_dim=4096,
+        hidden_dim=4096,
+        action_dim=7,
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.model = MLPResNet(
+            num_blocks=2, input_dim=input_dim*ACTION_DIM, hidden_dim=hidden_dim, output_dim=action_dim
+        )
+
+    def predict_action(self, actions_hidden_states):
+        # actions_hidden_states: last hidden states of Transformer corresponding to action tokens in sequence
+        # - shape: (batch_size, chunk_len * action_dim, hidden_dim)
+        batch_size = actions_hidden_states.shape[0]
+        device = actions_hidden_states.device
+        rearranged_actions_hidden_states = actions_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
+        action = self.model(rearranged_actions_hidden_states)
+        return action
+
+
 class MLPResNet_idcat(nn.Module):
     """MLP with residual connection blocks."""
     def __init__(self, num_blocks, input_dim, hidden_dim, output_dim):

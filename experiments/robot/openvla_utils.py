@@ -24,8 +24,8 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction, OpenVLAForActionPrediction_MMNv1
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-#from prismatic.models.action_heads import DiffusionActionHead, 
-from prismatic.models.action_heads import L1RegressionActionHead_idcat, L1RegressionDistHead
+#from prismatic.models.action_heads import DiffusionActionHead,
+from prismatic.models.action_heads import L1RegressionActionHead, L1RegressionActionHead_idcat, L1RegressionDistHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import ProprioProjector
 from prismatic.vla.constants import (
@@ -433,6 +433,60 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
         proprio_projector.load_state_dict(state_dict)
 
     return proprio_projector
+
+def get_action_head(cfg: Any, llm_dim: int) -> L1RegressionActionHead:
+    """
+    Get the native (stock) continuous-action head for L1-regression action prediction.
+
+    Ported from `moojink/openvla-oft`'s `experiments/robot/openvla_utils.py::get_action_head`,
+    trimmed to the L1-regression path only (the released LIBERO-spatial checkpoint's
+    `action_head--150000_checkpoint.pt` is an L1-regression head; diffusion-based
+    action heads are out of scope for this stock-eval harness).
+
+    Args:
+        cfg: Configuration object with `use_l1_regression`, `use_diffusion`, and
+            `pretrained_checkpoint` attributes.
+        llm_dim: Dimension of the language model (used as both the head's input and hidden dim).
+
+    Returns:
+        L1RegressionActionHead: The initialized, checkpoint-loaded action head (bfloat16, eval mode).
+    """
+    assert not (getattr(cfg, "use_l1_regression", True) and getattr(cfg, "use_diffusion", False)), (
+        "Cannot use both L1 regression and diffusion action head!"
+    )
+    if getattr(cfg, "use_diffusion", False):
+        raise NotImplementedError(
+            "Diffusion action heads are not ported in this stock-eval harness; "
+            "the released LIBERO-spatial checkpoint uses L1 regression."
+        )
+
+    action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
+    action_head = action_head.to(torch.bfloat16).to(DEVICE)
+    action_head.eval()
+
+    # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+        model_path_to_action_head_name = {
+            "moojink/openvla-7b-oft-finetuned-libero-spatial": "action_head--150000_checkpoint.pt",
+            "moojink/openvla-7b-oft-finetuned-libero-object": "action_head--150000_checkpoint.pt",
+            "moojink/openvla-7b-oft-finetuned-libero-goal": "action_head--50000_checkpoint.pt",
+            "moojink/openvla-7b-oft-finetuned-libero-10": "action_head--150000_checkpoint.pt",
+            "moojink/openvla-7b-oft-finetuned-libero-spatial-object-goal-10": "action_head--300000_checkpoint.pt",
+        }
+        if cfg.pretrained_checkpoint not in model_path_to_action_head_name.keys():
+            raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
+        action_head_path = hf_hub_download(
+            repo_id=cfg.pretrained_checkpoint, filename=model_path_to_action_head_name[cfg.pretrained_checkpoint]
+        )
+        state_dict = load_component_state_dict(action_head_path)
+        action_head.load_state_dict(state_dict)
+    else:
+        checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_head")
+        state_dict = load_component_state_dict(checkpoint_path)
+        action_head.load_state_dict(state_dict)
+
+    return action_head
+
 
 def resize_image_for_policy(img: np.ndarray, resize_size: Union[int, Tuple[int, int]]) -> np.ndarray:
     """
