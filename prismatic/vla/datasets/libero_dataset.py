@@ -54,6 +54,14 @@ from torch.utils.data import Dataset
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, IGNORE_INDEX, NUM_ACTIONS_CHUNK
 
+# Reused (not reimplemented) so the base's TRAINING images match its EVAL images
+# bit-for-bit: `get_vla_action` (experiments/robot/openvla_utils.py) builds the base's
+# `primary_image`/wrist image via `prepare_images_for_vla(..., cfg.center_crop=True)`,
+# i.e. `resize_image_for_policy(img, 224)` then `center_crop_image` (crop_scale=0.9). Without
+# this, the dataset fed the frozen base the raw ~256px RLDS frame (no center-crop), a
+# train/eval image-distribution skew on the base inputs -- see task-4.1 report.
+from experiments.robot.openvla_utils import prepare_images_for_vla
+
 # === Checkpoint / dataset identity (must match experiments/robot/libero/base_config.py) ===
 PRETRAINED_CHECKPOINT = "moojink/openvla-7b-oft-finetuned-libero-spatial"
 UNNORM_KEY = "libero_spatial_no_noops"
@@ -87,6 +95,24 @@ def _to_edge_frame(img: Image.Image) -> torch.Tensor:
     """Resize a PIL image to 96x96, to_tensor, ImageNet-normalize -> [3, 96, 96]."""
     frame = TF.resize(TF.to_tensor(img.convert("RGB")), (96, 96))
     return _edge_normalize(frame)
+
+
+class _BaseImageCfg:
+    """Minimal stand-in for the `cfg` argument `prepare_images_for_vla` reads --
+    only `cfg.center_crop` is consulted inside that function -- so we can call the
+    EXACT eval function without constructing a full `GenerateConfig`/`LiberoBaseConfig`.
+    """
+
+    center_crop = True
+
+
+def _to_base_image(raw_image: np.ndarray) -> Image.Image:
+    """Turn a raw RLDS frame (uint8 HxWx3 numpy array, e.g. ~256px) into the exact PIL
+    image the frozen base sees at eval: `resize_image_for_policy(img, 224)` then
+    `center_crop_image` (crop_scale 0.9), via `prepare_images_for_vla(..., center_crop=True)`
+    -- the SAME call `get_vla_action` makes for both stock and edge modes.
+    """
+    return prepare_images_for_vla([np.asarray(raw_image)], _BaseImageCfg())[0]
 
 
 def _apply_libero_action_transform(action_chunk_raw: np.ndarray) -> np.ndarray:
@@ -324,7 +350,12 @@ class LiberoSpatialDataset(Dataset):
 
         primary_now = Image.fromarray(ep["image"][t])
         primary_prev = Image.fromarray(ep["image"][t - 1]) if t > 0 else primary_now
-        wrist_now = Image.fromarray(ep["wrist_image"][t])
+
+        # Base-model images ONLY: resize-to-224 + center-crop to match the eval/stock path
+        # bit-for-bit (see `_to_base_image`). The 96px edge frames built below from
+        # `primary_now`/`primary_prev` stay uncropped on both training and eval.
+        base_primary_image = _to_base_image(ep["image"][t])
+        base_wrist_image = _to_base_image(ep["wrist_image"][t])
 
         proprio_raw = np.asarray(ep["state"][t], dtype=np.float32)
         proprio = _bounds_q99_normalize(proprio_raw, self._proprio_stats) if self._proprio_stats else proprio_raw
@@ -343,8 +374,8 @@ class LiberoSpatialDataset(Dataset):
             processor=self.processor,
             action_tokenizer=self.action_tokenizer,
             task_label=task_label,
-            primary_image=primary_now,
-            wrist_image=wrist_now,
+            primary_image=base_primary_image,
+            wrist_image=base_wrist_image,
             proprio=proprio,
             action_chunk=action_chunk,
             predict_stop_token=self.predict_stop_token,
