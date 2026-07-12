@@ -84,3 +84,12 @@ wandb run: https://wandb.ai/leon129506/asyncvla-libero/runs/tvusfvhj
 topline (~0.9+). Per-task SRs are noisy at only 10 trials/task, but the aggregate gap is
 large enough to flag per the Task 3.2 sanity gate — if the full sweep confirms this, debug
 base loading / prompt / normalization before validating the edge against it.
+
+## Stock topline — FORK-RESTORED (RTX 5090, 50 trials) — GATE PASSED
+- Date: 2026-07-12
+- Env fix: moojink/transformers-openvla-oft (4.40.1) restored for bidirectional attention (commit 4355b6e).
+- Command: `MUJOCO_GL=egl .venv/bin/python -m experiments.robot.libero.run_libero_eval --mode stock --task_suite_name libero_spatial --num_trials_per_task 5 --num_tasks 10`
+- Result: Total episodes 50, Total successes 50 -> **Overall SR = 1.0000**
+- Contrast: stock transformers 4.47.1 (causal attn) gave SR = 0.61 on 100 trials.
+- Conclusion: base pipeline reproduces stock OpenVLA-OFT LIBERO-Spatial behavior. Gate PASSED.
+- NOTE: official SR_topline for the report = full 500-trial protocol on NCHC Nano4 (this 50-trial local run validates the pipeline).
