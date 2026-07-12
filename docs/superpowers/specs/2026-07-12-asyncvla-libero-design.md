@@ -19,6 +19,9 @@ per-step latency), but the work is **staged into two plans**:
   the exact modules, training, and co-located inference behavior; retarget nav → 7-DoF
   manipulation and the frozen OpenVLA-OFT LIBERO base. Get it training and running on
   LIBERO-Spatial. **No two-rate async loop, no latency study.**
+  **Acceptance bar:** our base+edge success rate must be **close to the stock
+  OpenVLA-OFT-LIBERO topline SR** — so we run the stock model in the same LIBERO-Spatial
+  sim and compare directly (see §5, §7).
 - **Phase 2 (next plan, deferred): our interpretation of the paper.** Build the
   Algorithm-1 two-rate asynchronous loop (workstation/edge frequencies, delayed-frame
   timestamp matching), the latency/speedup measurement, and the frequency/cadence sweep.
@@ -64,6 +67,9 @@ and latency measurement are *paper interpretation* and are **deferred to Phase 2
 | Benchmark | **LIBERO-Spatial** (10 tasks) first |
 | North-star objective | Async speedup thesis (SR retained + per-step latency reduced) — **demonstrated in Phase 2** |
 | Phase 1 objective | **Faithful code mirror on LIBERO**: modules ported, trains, runs functionally |
+| Phase 1 success criterion | Base+edge SR **close to stock OpenVLA-OFT-LIBERO topline SR** (target: within ~5% absolute SR — confirm at review), same eval protocol |
+| Topline baseline | Stock OpenVLA-OFT-LIBERO (native action head, no edge), evaluated in the same LIBERO-Spatial sim |
+| Eval protocol | OpenVLA-OFT standard: 10 LIBERO-Spatial tasks × 50 rollouts = 500 trials, identical seeds/config for stock and ours |
 | Edge design | **Approach A** — edge predicts the **full** 8×7 action chunk; residual-edge is a Phase-2 fallback |
 | Edge encoders | EfficientNet-B0, **init from scratch** (mirrors released code; ImageNet init also known to hurt LIBERO 96px) |
 | Action space | 7-DoF: 6 EEF deltas + 1 gripper (`ACTION_DIM=7`, `NUM_ACTIONS_CHUNK=8`) |
@@ -119,16 +125,28 @@ instruction), current frame @96px, previous frame @96px, GT 8×7 chunk, normaliz
 stats. Built on the repo's existing RLDS/OXE plumbing (which already contains LIBERO
 configs); source demos = LIBERO-Spatial RLDS (OpenVLA-OFT `modified_libero_rlds`).
 
-### Inference / functional eval (Phase 1) — mirrors `run_asyncvla.py::run_forward_pass`
+### Evaluation (Phase 1) — topline comparison in LIBERO-Spatial sim
 
-Reproduce the released forward pass on LIBERO: base → projector → `vla_feature`; edge on
-current + previous frame + `vla_feature` → chunk. To validate the port end-to-end, run a
-**synchronous** LIBERO-Spatial sim rollout (base + edge every control step, edge's action
-executed) and report **success rate**. This confirms the ported architecture produces
-useful manipulation actions.
+The same eval harness runs **two configurations** in the LIBERO-Spatial sim under an
+**identical protocol** (10 tasks × 50 rollouts = 500 trials, same seeds/config):
+
+1. **Topline baseline — stock OpenVLA-OFT-LIBERO.** The base model produces actions via
+   its **native** action head (OpenVLA-OFT parallel decoding + L1 continuous head), no
+   edge. Yields `SR_topline`. This is both the reference number and the base-loading
+   sanity check (we should reproduce the published stock SR).
+2. **Ours — AsyncVLA-LIBERO (base + edge).** Same frozen base; actions come from the
+   **edge adapter**, mirroring the released `run_forward_pass` (base → projector →
+   `vla_feature`; edge on current + previous frame + `vla_feature` → chunk). Rollout is
+   **synchronous** (base + edge every control step, edge's action executed). Yields
+   `SR_ours`.
+
+**Phase-1 success:** `SR_ours` is close to `SR_topline` (target within ~5% absolute SR —
+confirm at review). Report both SRs (overall + per-task) side by side to wandb.
 
 **Explicitly NOT in Phase 1:** decoupling base/edge rates, running base less often than
-edge, timestamp buffers, latency measurement, cadence/frequency sweep. Those are Phase 2.
+edge, timestamp buffers, latency measurement, cadence/frequency sweep. Those are Phase 2
+(the synchronous base+edge rollout here is a functional/quality comparison, not a speed
+claim).
 
 ## 6. New files (Phase 1; navigation code untouched)
 
@@ -139,8 +157,9 @@ edge, timestamp buffers, latency measurement, cadence/frequency sweep. Those are
   frame, GT chunk targets).
 - `vla-scripts/train_asyncvla_libero.py` — mirror of `train_asyncvla.py`: frozen base;
   train edge + projector; action-chunk loss; DDP; wandb.
-- `experiments/robot/libero/run_libero_eval.py` — **synchronous** LIBERO-Spatial rollout
-  for functional validation + SR (base + edge every step).
+- `experiments/robot/libero/run_libero_eval.py` — LIBERO-Spatial rollout supporting **two
+  modes** under one protocol: `stock` (native OpenVLA-OFT head → `SR_topline`) and `edge`
+  (our base+edge → `SR_ours`); reports overall + per-task SR side by side to wandb.
 - `inference/run_asyncvla_libero.py` *(optional)* — single-episode smoke test mirroring the
   released demo forward pass.
 
@@ -148,9 +167,13 @@ edge, timestamp buffers, latency measurement, cadence/frequency sweep. Those are
 
 - **Unit:** edge forward → `(B, 8, 7)`; projector output shape; dataloader sample shapes.
 - **Integration:** overfit a tiny LIBERO batch (edge + projector) → loss decreases.
-- **Base sanity:** confirm the frozen base reproduces stock LIBERO-Spatial SR *before*
-  attaching the edge (validates checkpoint loading + hidden-state extraction).
-- **Smoke eval:** 1–2 LIBERO-Spatial episodes end-to-end through the synchronous rollout.
+- **Topline reproduction (gates everything):** run the stock OpenVLA-OFT-LIBERO model in
+  the sim and confirm it reproduces the published stock LIBERO-Spatial SR. This validates
+  checkpoint loading + the eval harness and establishes `SR_topline` before the edge is
+  attached.
+- **Smoke eval:** 1–2 LIBERO-Spatial episodes end-to-end through the base+edge rollout.
+- **Final comparison:** full 500-trial protocol for both `stock` and `edge` modes; check
+  `SR_ours` vs `SR_topline` against the acceptance bar.
 
 ## 8. Risks & mitigations (Phase 1)
 
