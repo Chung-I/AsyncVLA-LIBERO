@@ -43,19 +43,14 @@ def test_libero_pixel_values_has_two_images():
 
 def test_libero_gt_action_chunk_gripper_is_standardized():
     """`gt_action_chunk`'s gripper dim (index 6) must reflect the OXE `libero_dataset_transform`
-    standardization (clip to [0, 1], then invert: +1 = open, 0 = close) applied to the raw
-    RLDS action BEFORE tokenization/normalization -- not the raw {-1, +1} LIBERO convention
-    the tfrecords store directly.
+    standardization -- clip to [0, 1] then invert (1 - x), giving 1 = open, 0 = close -- applied
+    to the raw RLDS action, NOT the raw {-1, +1} LIBERO convention the tfrecords store directly.
 
-    The checkpoint's `dataset_statistics.json` gives this dim q01=min=0, q99=max=1, so
-    BOUNDS_Q99-normalizing the *standardized* gripper value (0 or 1) lands at -1 or +1 --
-    i.e. the normalized value can reach +1 (open) but, once correctly standardized, can never
-    go below 0 pre-normalization and so never lands below -1 - eps post-normalization. The raw,
-    un-standardized tfrecord convention for this real sample's first NUM_ACTIONS_CHUNK steps is
-    a constant -1 (raw "open"), which -- fed through the SAME q01=0/q99=1 normalizer without the
-    transform -- would incorrectly clip to -1 (post-normalization "close"). So checking the
-    normalized value lands at +1 (within [-0.01, 1.01], not the raw-bug value of -1) directly
-    catches a missing/incorrect standardization.
+    The checkpoint's `dataset_statistics.json` masks this dim out of BOUNDS_Q99 normalization
+    (it is passed through), so `gt_action_chunk[..., 6]` stays in the standardized {0, 1} range.
+    This real sample's first NUM_ACTIONS_CHUNK steps are raw -1 ("open") in the tfrecord; the
+    transform maps that to 1. Asserting the value sits in [-0.01, 1.01] (and is not the raw-bug
+    value -1) directly catches a missing/incorrect gripper standardization.
     """
     from prismatic.vla.datasets.libero_dataset import DEFAULT_DATA_DIR, LiberoSpatialDataset, _has_tfrecords
 

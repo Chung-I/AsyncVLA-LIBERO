@@ -140,12 +140,6 @@ async edge.
 > each 7B base needs ~16 GB and two do not fit on the 32 GB RTX 5090, so overlapping runs
 > OOM-killed each other. This 50/50 result is from the single run that had the GPU to itself
 > (wandb `1069en7s`). Re-running serially reproduces it.
-
-## Stock topline — FORK-RESTORED (RTX 5090, 50 trials) — GATE PASSED
-- Date: 2026-07-12
-- Env fix: moojink/transformers-openvla-oft (4.40.1) restored for bidirectional attention (commit 4355b6e).
-- Command: `MUJOCO_GL=egl .venv/bin/python -m experiments.robot.libero.run_libero_eval --mode stock --task_suite_name libero_spatial --num_trials_per_task 5 --num_tasks 10`
-- Result: Total episodes 50, Total successes 50 -> **Overall SR = 1.0000**
-- Contrast: stock transformers 4.47.1 (causal attn) gave SR = 0.61 on 100 trials.
-- Conclusion: base pipeline reproduces stock OpenVLA-OFT LIBERO-Spatial behavior. Gate PASSED.
-- NOTE: official SR_topline for the report = full 500-trial protocol on NCHC Nano4 (this 50-trial local run validates the pipeline).
+**GATE PASSED** — base pipeline reproduces stock OpenVLA-OFT LIBERO-Spatial behavior. The
+official `SR_topline` for the report comes from the full 500-trial protocol on NCHC Nano4;
+this 50-trial local run validates the pipeline.
