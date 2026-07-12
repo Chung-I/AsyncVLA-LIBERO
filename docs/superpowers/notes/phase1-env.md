@@ -207,4 +207,9 @@ uv pip install --python .venv/bin/python --no-deps --reinstall-package transform
 uv pip install --python .venv/bin/python "tokenizers>=0.19.1,<0.20"
 ```
 Result: transformers 4.40.1 (fork), tokenizers 0.19.1, torch 2.11.0+cu128 intact. Base loads with
-NO version-mismatch warning. SR recovery confirmed separately (see phase1-results.md).
+NO version-mismatch warning.
+
+**Before/after SR:** stock LIBERO-Spatial topline **0.61** (100 trials, stock transformers 4.47.1)
+→ **1.00** (50 trials, fork-restored). See phase1-results.md ("Stock topline — fork-restored (50
+trials)", wandb run `1069en7s`). The fork must be installed `--no-deps` on this Blackwell / torch-2.11
+box (its pyproject pins old torch), and tokenizers pinned `<0.20`; both are reflected in pyproject.toml.
