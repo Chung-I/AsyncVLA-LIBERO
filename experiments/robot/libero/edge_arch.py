@@ -1,8 +1,12 @@
 r"""EdgeArch: single source of truth for the AsyncVLA-LIBERO edge adapter's capacity.
 
-The edge adapter is the ORIGINAL `Edge_adapter` class (`prismatic.models.small_head`),
-unmodified except for a single semantic-no-op line that lets its output head adapt to
-whatever `(NUM_ACTIONS_CHUNK, ACTION_DIM)` the caller is running under, plus its companion
+The edge adapter is the ORIGINAL `Edge_adapter` class (`prismatic.models.small_head`), with one
+added constructor kwarg -- `action_dim: int = 4` -- so its output head can be built at either the
+original nav width (the default, 4, used by every original caller) or the LIBERO width (7, passed
+explicitly here via `arch`/`ACTION_DIM`). This is NOT a no-op under `ACTION_DIM`: this branch
+retargeted that constant from 4 (nav) to 7 (LIBERO) in `prismatic/vla/constants.py` (commit
+`7954582`), so the head width must be parameterized rather than derived from `ACTION_DIM` directly
+-- see `tests/test_faithful_edge.py` for the full rationale. Plus its companion
 action-token projector (`Proj_Actiontokens`). Historical AsyncVLA-LIBERO runs trained it at
 512 width / 2 heads / 2 layers (the class defaults). The ORIGINAL AsyncVLA runs the edge at
 1024 width / 4 heads / 4 layers (`config_nav/dataset_config.yaml`, readable via

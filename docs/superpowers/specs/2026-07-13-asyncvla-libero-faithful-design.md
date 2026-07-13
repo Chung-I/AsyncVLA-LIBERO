@@ -25,10 +25,12 @@ one action executed). The deviations are capacity, delay range, loss, and augmen
 
 ## 2. Method: minimal-delta, not copy
 
-This worktree **is a git worktree of the AsyncVLA repo** — the original code is already present and
-unmodified (`prismatic/models/small_head.py`, `prismatic/vla/datasets/*`,
-`vla-scripts/train_asyncvla.py`, `config_nav/dataset_config.yaml`). There is nothing to copy. The
-rule is therefore:
+This worktree **is a git worktree of the AsyncVLA repo**, and most of the original code is present
+and unmodified. But `git diff main --stat` shows three original files ARE modified on this branch:
+`prismatic/vla/constants.py` (the LIBERO retarget, commit `7954582`), `prismatic/models/action_heads.py`
+(a new `L1RegressionActionHead` class added, additive), and `prismatic/models/small_head.py` (the
+`action_dim` parameterization described below). §7's deviation ledger records the consequences.
+The rule for everything else is therefore:
 
 1. **Call the original classes directly.** Use the original **`Edge_adapter`** — not a duplicate.
    Its output head width becomes a constructor parameter: `nn.Linear(64, 8 * 4)` →
@@ -36,12 +38,17 @@ rule is therefore:
    original nav width so every existing original caller (`train_asyncvla.py`,
    `run_asyncvla.py`, neither of which ever passes `action_dim`) is byte-identical to before —
    `NUM_ACTIONS_CHUNK * 4 == 8 * 4 == 32`. **This is NOT a no-op under `prismatic/vla/constants.py`'s
-   `ACTION_DIM`** — that constant is `7` (the LIBERO value; there is no
-   `ACTION_DIM=4` anywhere in this codebase), so hardcoding `NUM_ACTIONS_CHUNK * ACTION_DIM`
+   `ACTION_DIM`** — upstream AsyncVLA (`main`) defines `ACTION_DIM = 4` (and `POSE_DIM = 4`), the
+   nav action width; the `asyncvla-libero` branch this branch forked from retargeted both to `7`
+   for LIBERO's 7-DoF action space (commit `7954582`), so on THIS branch `ACTION_DIM` is `7` and no
+   longer means "the nav width". The head width must therefore NOT be derived from `ACTION_DIM`,
+   because this branch has repurposed that constant: hardcoding `NUM_ACTIONS_CHUNK * ACTION_DIM`
    would silently build a 56-wide head for the original nav callers too and break both
    `train_asyncvla.py`'s loss (shape mismatch against the 4-D `daction_ref`) and
-   `run_asyncvla.py`'s checkpoint load (`[32,64]` vs `[56,64]`). The LIBERO path instead passes
-   `action_dim=ACTION_DIM` (=7) **explicitly**, via `build_edge_and_proj`. The reshape at the
+   `run_asyncvla.py`'s checkpoint load (`[32,64]` vs `[56,64]`). Hardcoding the nav default `4` in
+   the signature instead keeps `Edge_adapter()` correct for the original's callers *independently*
+   of the constants retarget, while the LIBERO path passes `action_dim=ACTION_DIM` (=7)
+   **explicitly**, via `build_edge_and_proj`. The reshape at the
    end of `forward` already uses `(NUM_ACTIONS_CHUNK, -1)` and adapts for free either way.
    **Retire `Edge_adapter_manip`** (it was only ever `Edge_adapter` with that output
    parametrized). `Proj_Actiontokens` and `MultiLayerDecoder_trans` are already used unmodified.
@@ -167,6 +174,7 @@ to expose the cliff — itself a finding about what `k_max` buys.
 | Deviation | Why |
 |---|---|
 | `shead`/`action_proj` trained in **fp32** → original trains in **bf16** | Original (`train_asyncvla.py:1022,1031`) casts `shead`/`action_proj` to bf16. We build/train both in fp32 (`edge_arch.py:103-104`). Not embodiment-forced — a deliberate choice (numerical headroom for a from-scratch small head on ~25x less data), recorded here so it isn't mistaken for an oversight. |
+| Original nav code paths no longer runnable on this branch | The inherited LIBERO retarget of `prismatic/vla/constants.py` (`ACTION_DIM`/`POSE_DIM` 4 → 7, commit `7954582`) means the ORIGINAL nav code paths (`vla-scripts/train_asyncvla.py`, `inference/run_asyncvla.py`) are no longer runnable on this branch: `Proj_Actiontokens` (`prismatic/models/small_head.py:233`) builds `MLPResNet_idcat(input_dim=4096*7=28672)` where the released nav `action_proj` checkpoint expects `4096*4=16384`. `Edge_adapter`'s own `shead` checkpoint DOES still load (its head defaults to the nav width 4 → 32). This is accepted: the fork is LIBERO-only. It is recorded here because the minimal-delta method's premise is that the original code is present and working, and for the nav path that is now only partly true. |
 
 ## 8. Files (this worktree)
 

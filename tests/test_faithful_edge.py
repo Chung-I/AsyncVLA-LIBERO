@@ -18,13 +18,16 @@ def test_original_edge_adapter_outputs_libero_chunk():
 
 def test_output_head_width_is_parameterized_not_hardcoded():
     """`Edge_adapter.action_predictor`'s output width is `NUM_ACTIONS_CHUNK * action_dim`,
-    where `action_dim` is now a constructor kwarg. NOTE: the original nav action is 4-D
-    (`ACTION_DIM=7` in `prismatic/vla/constants.py` is the LIBERO value only), so this is
-    NOT a no-op under `ACTION_DIM` -- the default `action_dim=4` (32-wide) preserves the
-    original literal `Linear(64, 8 * 4)` byte-for-byte for every original caller
-    (`vla-scripts/train_asyncvla.py`, `inference/run_asyncvla.py`, which never pass
-    `action_dim`); the LIBERO path passes `action_dim=ACTION_DIM` (=7, 56-wide) explicitly
-    via `build_edge_and_proj`."""
+    where `action_dim` is now a constructor kwarg. NOTE: upstream AsyncVLA (`main`) defines
+    `ACTION_DIM = 4` -- the nav action width -- but the `asyncvla-libero` branch this branch
+    forked from retargeted `prismatic/vla/constants.py`'s `ACTION_DIM`/`POSE_DIM` from 4 to 7
+    for LIBERO's 7-DoF action space (commit `7954582`), so on THIS branch `ACTION_DIM` is 7
+    and no longer means "the nav width". The head width must therefore NOT be derived from
+    `ACTION_DIM` -- the default `action_dim=4` (32-wide) hardcodes the original nav width
+    directly, independent of the retargeted constant, preserving the original literal
+    `Linear(64, 8 * 4)` byte-for-byte for every original caller (`vla-scripts/train_asyncvla.py`,
+    `inference/run_asyncvla.py`, which never pass `action_dim`); the LIBERO path passes
+    `action_dim=ACTION_DIM` (=7, 56-wide) explicitly via `build_edge_and_proj`."""
     edge_original_default = Edge_adapter(obs_encoding_size=1024, mha_num_attention_heads=4, mha_num_attention_layers=4)
     assert edge_original_default.action_predictor[-1].out_features == 8 * 4 == 32
 
@@ -45,6 +48,10 @@ def test_build_edge_and_proj_at_faithful_capacity():
     edge, proj = build_edge_and_proj(llm_dim=4096, device=torch.device("cpu"), arch=EdgeArch.from_config_nav())
     assert isinstance(edge, Edge_adapter)
     assert edge.obs_encoding_size == 1024
+    # pins the LIBERO edge head width: build_edge_and_proj must pass action_dim=ACTION_DIM,
+    # not fall back to Edge_adapter's own nav default (4) -- see F1 / test_faithful_edge.py's
+    # test_output_head_width_is_parameterized_not_hardcoded for the full rationale.
+    assert edge.action_predictor[-1].out_features == NUM_ACTIONS_CHUNK * ACTION_DIM  # 8 x 7 = 56
     # projector token width MUST equal the edge token width (they are concatenated)
     hidden = torch.randn(2, NUM_ACTIONS_CHUNK * ACTION_DIM, 4096)
     feat = proj.predict_action(hidden, torch.zeros(2))
