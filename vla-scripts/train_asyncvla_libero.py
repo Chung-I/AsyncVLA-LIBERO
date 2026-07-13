@@ -6,13 +6,13 @@ FROZEN OpenVLA-OFT LIBERO base checkpoint.
 
 Structure mirrors `vla-scripts/train_asyncvla.py` (config dataclass, DDP init via
 `accelerate.PartialState`, wandb init, AdamW optimizer, periodic checkpoint save,
-`train/l1_loss` logging), but with LoRA and all navigation datasets/loss terms removed:
+`train/loss` logging), but with LoRA and all navigation datasets/loss terms removed:
 
   - Base: `experiments.robot.libero.base_config.build_frozen_base` -> frozen
     `(vla, processor, proprio_projector)`. Never trained; no LoRA.
   - Per-step forward: `extract_actions_hidden_states` (base, no_grad) ->
     `proj.predict_action` -> `edge(obs_img_96, past_img_96, vla_feature)`.
-  - Loss: `F.l1_loss(pred_chunk, gt_action_chunk)` on the [B, 8, 7] action chunk.
+  - Loss: `faithful_chunk_loss` (3-term weighted MSE: 0.5*15*delta + 0.5*traj + 0.1*smooth).
   - Trainable params: `Edge_adapter_manip` ("shead") + `Proj_Actiontokens` ("proj") only.
 
 CLI entrypoint (torchrun-compatible):
@@ -56,11 +56,50 @@ from experiments.robot.libero.base_features import extract_actions_hidden_states
 # (`train_one_batch_smoke`, `tests/test_train_overfit*.py`, `latency_bench.py`-style usage)
 # keep working unchanged; `edge_arch.py` is the single source of truth for its body.
 from experiments.robot.libero.edge_arch import EdgeArch, build_edge_and_proj, save_edge_arch
+from prismatic.vla.constants import ACTION_DIM
 from prismatic.vla.datasets.libero_dataset import (
     NUM_BASE_PATCHES,
     LiberoSpatialDataset,
     collate_libero_batch,
 )
+
+# ==============================
+# Loss Function
+# ==============================
+
+# The gripper is the LAST action dim and is an ABSOLUTE command -- it does not integrate.
+NUM_EEF_DIMS = ACTION_DIM - 1  # 6
+
+
+def faithful_chunk_loss(pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """AsyncVLA's 3-term weighted MSE, mirroring `vla-scripts/train_asyncvla.py:552,557,559`.
+
+    The original edge emits DELTAS and `delta_to_pose` integrates them into a waypoint
+    trajectory; the loss penalizes the deltas (weight 0.5*15), the integrated trajectory
+    (0.5) and the trajectory's smoothness (0.1). Their `delta_to_pose` is SE(2) body-frame
+    composition (nav-only); LIBERO's OSC deltas are world-frame, so `cumsum` is the analog.
+    Their 4th term (0.1 * MSE on the LeLaN object pose) has no LIBERO analog and is dropped.
+    """
+    pred_traj = torch.cumsum(pred[..., :NUM_EEF_DIMS], dim=1)
+    gt_traj = torch.cumsum(gt[..., :NUM_EEF_DIMS], dim=1)
+    # sm_ref mirrors `cat(action_orig, predicted_actions[:, 0:-1])`: the previous predicted
+    # waypoint, with the chunk's first entry compared against the origin (the current EEF
+    # pose is the origin of this relative frame). NOT detached -- matching the original.
+    sm_ref = torch.cat([torch.zeros_like(pred_traj[:, :1]), pred_traj[:, :-1]], dim=1)
+
+    mse_delta = F.mse_loss(pred, gt)
+    mse_traj = F.mse_loss(pred_traj, gt_traj)
+    mse_smooth = F.mse_loss(pred_traj, sm_ref)
+
+    loss = 0.5 * 15.0 * mse_delta + 0.5 * mse_traj + 0.1 * mse_smooth
+    metrics = {
+        "loss": loss.item(),
+        "mse_delta": mse_delta.item(),
+        "mse_traj": mse_traj.item(),
+        "mse_smooth": mse_smooth.item(),
+    }
+    return loss, metrics
+
 
 # ==============================
 # Config
@@ -152,7 +191,7 @@ def run_forward_pass(
     batch: Dict[str, torch.Tensor],
     device: torch.device,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Per-step forward: frozen base (no_grad) -> proj -> edge -> L1 chunk loss.
+    """Per-step forward: frozen base (no_grad) -> proj -> edge -> 3-term faithful chunk loss.
 
     Returns (loss, metrics) where `loss` carries gradients (for edge + proj only) and
     `metrics` holds detached values for logging.
@@ -172,9 +211,7 @@ def run_forward_pass(
     pred_chunk = edge(obs_img_96, past_img_96, vla_feature)  # [B, 8, 7] fp32
 
     gt_action_chunk = batch["gt_action_chunk"].to(device=device, dtype=torch.float32)  # [B, 8, 7]
-    loss = F.l1_loss(pred_chunk, gt_action_chunk)
-
-    metrics = {"l1_loss": loss.item()}
+    loss, metrics = faithful_chunk_loss(pred_chunk, gt_action_chunk)
     return loss, metrics
 
 
@@ -272,11 +309,16 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
                 loss.backward()
                 optimizer.step()
 
-                recent_l1.append(metrics["l1_loss"])
+                recent_l1.append(metrics["loss"])
                 progress.update()
 
                 if distributed_state.is_main_process and step % cfg.wandb_log_freq == 0:
-                    wandb.log({"train/l1_loss": sum(recent_l1) / len(recent_l1)}, step=step)
+                    wandb.log({
+                        "train/loss": sum(recent_l1) / len(recent_l1),
+                        "train/mse_delta": metrics["mse_delta"],
+                        "train/mse_traj": metrics["mse_traj"],
+                        "train/mse_smooth": metrics["mse_smooth"],
+                    }, step=step)
 
                 if step > 0 and step % cfg.save_freq == 0:
                     if world_size > 1:
@@ -345,7 +387,7 @@ def train_one_batch_smoke(num_iters: int = 200, delay_aware: bool = False, k_max
         loss.backward()
         optimizer.step()
 
-        losses.append(metrics["l1_loss"])
+        losses.append(metrics["loss"])
 
     return losses
 
