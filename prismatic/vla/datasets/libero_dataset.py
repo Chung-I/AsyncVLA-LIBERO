@@ -97,6 +97,31 @@ def _to_edge_frame(img: Image.Image) -> torch.Tensor:
     return _edge_normalize(frame)
 
 
+# Random-crop augmentation, ported from the ORIGINAL AsyncVLA
+# (`prismatic/vla/datasets/lelan_dataset.py:113-114, 363-371`):
+#     voffset = int(224.0 * v_random * random.random())
+#     hoffset = int(224.0 * h_random * random.random())
+#     PILbox  = (hoffset, voffset, 224 - hoffset, 224 - voffset)
+# Offsets are FRACTIONS of the frame, so they carry over to our 256px LIBERO frames.
+# The original also horizontally flips (and mirrors the actions); we do NOT -- mirroring
+# 6-DoF EEF + gripper is unsafe (see the spec's deviation ledger).
+V_RANDOM = 0.2
+H_RANDOM = 0.1
+
+
+def _sample_crop_offsets(h: int, w: int, rng: "np.random.RandomState") -> Tuple[int, int]:
+    """One (voffset, hoffset) per SAMPLE -- shared by every image of that sample."""
+    return int(h * V_RANDOM * rng.random()), int(w * H_RANDOM * rng.random())
+
+
+def _apply_crop(raw: np.ndarray, voffset: int, hoffset: int) -> np.ndarray:
+    """Symmetric crop, matching the original's PILbox = (h, v, W-h, H-v)."""
+    if voffset == 0 and hoffset == 0:
+        return raw
+    h, w = raw.shape[:2]
+    return raw[voffset : h - voffset, hoffset : w - hoffset]
+
+
 class _BaseImageCfg:
     """Minimal stand-in for the `cfg` argument `prepare_images_for_vla` reads --
     only `cfg.center_crop` is consulted inside that function -- so we can call the
@@ -315,10 +340,19 @@ class LiberoSpatialDataset(Dataset):
         delay_aware: bool = False,
         k_max: int = 15,
         rng_seed: int = 0,
+        image_aug: bool = False,
     ) -> None:
         self.predict_stop_token = predict_stop_token
         self.processor = processor if processor is not None else load_processor()
         self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
+
+        # Train-only random-crop augmentation, ported from the ORIGINAL AsyncVLA (see
+        # `_sample_crop_offsets`/`_apply_crop` above). Defaults to False so every existing
+        # (eval/Phase-1) path stays byte-identical. `_last_crop_offsets` records the single
+        # shared box of the most recent `__getitem__` call, for test inspection.
+        self.image_aug = image_aug
+        self._aug_rng = np.random.RandomState(rng_seed)
+        self._last_crop_offsets: Tuple[int, int] = (0, 0)
 
         # Delay-aware sampling (Phase 2): when enabled, the BASE is trained/evaluated on a
         # stale frame `t - k` instead of the current frame `t` (see `_sample_delay` /
@@ -374,17 +408,33 @@ class LiberoSpatialDataset(Dataset):
         else:
             t_base = t  # Phase-1 behavior unchanged
 
-        primary_now = Image.fromarray(ep["image"][t])
-        if self.delay_aware:
-            primary_prev = Image.fromarray(ep["image"][t_base])  # edge "past" = base's frame I_{t-k}
-        else:
-            primary_prev = Image.fromarray(ep["image"][t - 1]) if t > 0 else primary_now
+        raw_now = ep["image"][t]
+        raw_base = ep["image"][t_base]
+        raw_wrist = ep["wrist_image"][t_base]
+        raw_prev = raw_base if self.delay_aware else (ep["image"][t - 1] if t > 0 else raw_now)
+
+        # Train-only random-crop augmentation (ported from the ORIGINAL AsyncVLA; see
+        # `_sample_crop_offsets`/`_apply_crop`). ONE shared box per sample -- computed once
+        # and applied to every raw frame of this sample (base agentview, base wrist, edge
+        # current, edge past) -- BEFORE `_to_base_image`/`_to_edge_frame` run, exactly as the
+        # original applies one `PILbox` across its base/current/goal frames.
+        if self.image_aug:
+            v, hh = _sample_crop_offsets(raw_now.shape[0], raw_now.shape[1], self._aug_rng)
+            self._last_crop_offsets = (v, hh)
+            raw_now = _apply_crop(raw_now, v, hh)
+            raw_base = _apply_crop(raw_base, v, hh)
+            raw_wrist = _apply_crop(raw_wrist, v, hh)
+            raw_prev = _apply_crop(raw_prev, v, hh)
+
+        primary_now = Image.fromarray(raw_now)
+        primary_prev = Image.fromarray(raw_prev)
 
         # Base-model images ONLY: resize-to-224 + center-crop to match the eval/stock path
         # bit-for-bit (see `_to_base_image`), built from `t_base`. The 96px edge frames built
-        # below from `primary_now`/`primary_prev` stay uncropped on both training and eval.
-        base_primary_image = _to_base_image(ep["image"][t_base])
-        base_wrist_image = _to_base_image(ep["wrist_image"][t_base])
+        # below from `primary_now`/`primary_prev` stay uncropped on both training and eval
+        # (except for the shared augmentation box applied above, when `image_aug=True`).
+        base_primary_image = _to_base_image(raw_base)
+        base_wrist_image = _to_base_image(raw_wrist)
 
         proprio_raw = np.asarray(ep["state"][t_base], dtype=np.float32)
         proprio = _bounds_q99_normalize(proprio_raw, self._proprio_stats) if self._proprio_stats else proprio_raw
