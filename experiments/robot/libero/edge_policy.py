@@ -31,13 +31,18 @@ Chain per query (`EdgePolicy.act`):
      `run_libero_eval.py::process_action` (gripper normalize+invert) the same target space
      before stepping the env.
 
-Edge input frames (`obs_img_96`/`past_img_96`): current + PREVIOUS RAW agentview frame
-(pre-resize, pre-center-crop -- `get_libero_image(obs)`'s raw rotated output), resized to
-96x96 and ImageNet-normalized via
-`prismatic.vla.datasets.libero_dataset._to_edge_frame` -- the exact transform
-`LiberoSpatialDataset` uses to build `obs_img_96`/`past_img_96` at training time. At the
-first control step of an episode, `past == obs` (see `reset()`), matching
-`LiberoSpatialDataset.__getitem__`'s `t == 0` convention.
+Edge input frames (`obs_img_96`/`past_img_96`): current RAW agentview frame (pre-resize,
+pre-center-crop -- `get_libero_image(obs)`'s raw rotated output), resized to 96x96 and
+ImageNet-normalized via `prismatic.vla.datasets.libero_dataset._to_edge_frame` -- the exact
+transform `LiberoSpatialDataset` uses to build `obs_img_96`/`past_img_96` at training time.
+`past_img_96` is the 96px frame captured the last time the base was refreshed (see
+`_should_refresh`, `EdgeEvalConfig.base_cadence`): with `base_cadence=1` (default) the base
+refreshes every call, so `past == obs` on every call, matching Phase-1 behavior; with
+`base_cadence > 1`, `past_img_96` holds the frame from the last refresh while `obs_img_96`
+is always the current frame, giving the edge a stale/fresh frame pair mirroring the
+stale/fresh `vla_feature`. At the first call of an episode (cache empty after `reset()`),
+`past == obs` regardless of `base_cadence`, matching `LiberoSpatialDataset.__getitem__`'s
+`t == 0` convention.
 """
 
 from __future__ import annotations
@@ -72,6 +77,20 @@ class EdgeEvalConfig(LiberoBaseConfig):
 
     center_crop: bool = True
     unnorm_key: str = ""
+    base_cadence: int = 1
+    """Number of `EdgePolicy.act()` calls between frozen-base recomputes. `1` (default)
+    recomputes `vla_feature` every call, reproducing Phase-1 `EdgePolicy` behavior exactly.
+    `N > 1` recomputes on calls `0, N, 2N, ...` and holds the cached `vla_feature` (and the
+    base's 96px agentview frame captured at that recompute) stale for the edge on the calls
+    in between -- see `_should_refresh`."""
+
+
+def _should_refresh(step: int, cadence: int) -> bool:
+    """Returns whether the frozen base's `vla_feature` should be recomputed at `step`
+    (0-indexed act() call count), given a `base_cadence` of `cadence` act() calls between
+    base refreshes. `cadence == 1` refreshes every call (Phase-1 behavior); `cadence == N`
+    refreshes on calls `0, N, 2N, ...`, holding the cached feature/frame stale in between."""
+    return step % cadence == 0
 
 
 def resolve_unnorm_key(vla, task_suite_name: str) -> str:
@@ -143,62 +162,75 @@ class EdgePolicy:
         self.edge.eval()
         self.edge.to(device=self.device, dtype=torch.float32)
 
-        self._past_agentview_img: Optional[Image.Image] = None
+        self.base_cadence = cfg.base_cadence
+        self._step = 0
+        self._cached_feature: Optional[torch.Tensor] = None
+        self._cached_base_frame96: Optional[torch.Tensor] = None
 
     def reset(self) -> None:
-        """Clears the 1-frame agentview history. Call at the start of each episode so the
-        first control step's `past_img_96 == obs_img_96`."""
-        self._past_agentview_img = None
+        """Resets the step counter and clears the base-feature/frame cache. Call at the
+        start of each episode so the first `act()` call recomputes the base (cache is
+        empty) and `past_img_96 == obs_img_96` at that first call."""
+        self._step = 0
+        self._cached_feature = None
+        self._cached_base_frame96 = None
 
     @torch.no_grad()
     def act(self, obs: Dict[str, Any], task_description: str) -> List[np.ndarray]:
         """Runs base -> projector -> edge on the current raw LIBERO env `obs` and returns
         the predicted `[NUM_ACTIONS_CHUNK, ACTION_DIM]` action chunk as a list of
         `NUM_ACTIONS_CHUNK` unnormalized `[ACTION_DIM]` arrays.
+
+        Async cache (Phase-2): the frozen base's `vla_feature` (and the 96px agentview
+        frame captured alongside it) is recomputed only every `self.base_cadence` calls
+        (`_should_refresh`) or when the cache is empty (first call after `reset()`); the
+        edge runs every call on the CURRENT 96px frame plus the cached (possibly stale)
+        frame/feature pair. `base_cadence=1` refreshes on every call, so the cached frame
+        is always the just-captured current frame -- identical to Phase-1 `EdgePolicy.act`.
         """
         full_image = get_libero_image(obs)  # raw 256x256 uint8 agentview, rotated 180
         wrist_image = get_libero_wrist_image(obs)
 
-        proprio_raw = np.concatenate(
-            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-        )
-        proprio_norm_stats = self.vla.norm_stats[self.cfg.unnorm_key]["proprio"]
-        proprio = normalize_proprio(proprio_raw, proprio_norm_stats)
-
-        # Base-input image prep: identical helper `get_vla_action` uses (resize + optional
-        # center-crop), so the frozen base sees the same image distribution in both modes.
-        primary_pil, wrist_pil = prepare_images_for_vla([full_image, wrist_image], self.cfg)
-
-        dummy_action_chunk = np.zeros((NUM_ACTIONS_CHUNK, ACTION_DIM), dtype=np.float32)
-        item = build_base_item(
-            processor=self.processor,
-            action_tokenizer=self.action_tokenizer,
-            task_label=task_description,
-            primary_image=primary_pil,
-            wrist_image=wrist_pil,
-            proprio=proprio,
-            action_chunk=dummy_action_chunk,
-            predict_stop_token=True,
-        )
-        batch = {k: v.unsqueeze(0) for k, v in item.items()}
-
-        hidden = extract_actions_hidden_states(
-            self.vla, batch, self.proprio_projector, num_patches=NUM_BASE_PATCHES, device=self.device,
-        )  # [1, 56, 4096] bf16
-
-        taskid = torch.zeros(1, device=self.device)
-        vla_feature = self.proj.predict_action(hidden.to(torch.float32), taskid)  # [1, 8, 512] fp32
-
         current_pil = Image.fromarray(full_image)
-        if self._past_agentview_img is None:
-            self._past_agentview_img = current_pil
         obs_img_96 = _to_edge_frame(current_pil).unsqueeze(0).to(self.device)
-        past_img_96 = _to_edge_frame(self._past_agentview_img).unsqueeze(0).to(self.device)
-        self._past_agentview_img = current_pil
 
-        pred_chunk = self.edge(obs_img_96, past_img_96, vla_feature)  # [1, 8, 7] fp32, normalized space
+        if _should_refresh(self._step, self.base_cadence) or self._cached_feature is None:
+            proprio_raw = np.concatenate(
+                (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
+            )
+            proprio_norm_stats = self.vla.norm_stats[self.cfg.unnorm_key]["proprio"]
+            proprio = normalize_proprio(proprio_raw, proprio_norm_stats)
+
+            # Base-input image prep: identical helper `get_vla_action` uses (resize +
+            # optional center-crop), so the frozen base sees the same image distribution
+            # in both modes.
+            primary_pil, wrist_pil = prepare_images_for_vla([full_image, wrist_image], self.cfg)
+
+            dummy_action_chunk = np.zeros((NUM_ACTIONS_CHUNK, ACTION_DIM), dtype=np.float32)
+            item = build_base_item(
+                processor=self.processor,
+                action_tokenizer=self.action_tokenizer,
+                task_label=task_description,
+                primary_image=primary_pil,
+                wrist_image=wrist_pil,
+                proprio=proprio,
+                action_chunk=dummy_action_chunk,
+                predict_stop_token=True,
+            )
+            batch = {k: v.unsqueeze(0) for k, v in item.items()}
+
+            hidden = extract_actions_hidden_states(
+                self.vla, batch, self.proprio_projector, num_patches=NUM_BASE_PATCHES, device=self.device,
+            )  # [1, 56, 4096] bf16
+
+            taskid = torch.zeros(1, device=self.device)
+            self._cached_feature = self.proj.predict_action(hidden.to(torch.float32), taskid)  # [1, 8, 512] fp32
+            self._cached_base_frame96 = obs_img_96
+
+        pred_chunk = self.edge(obs_img_96, self._cached_base_frame96, self._cached_feature)  # [1, 8, 7] fp32, normalized space
 
         normalized_actions = pred_chunk[0].detach().cpu().numpy().astype(np.float32)
         actions = self.vla._unnormalize_actions(normalized_actions, self.cfg.unnorm_key)  # [8, 7]
 
+        self._step += 1
         return [actions[i] for i in range(actions.shape[0])]
