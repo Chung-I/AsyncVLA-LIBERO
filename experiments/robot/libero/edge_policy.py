@@ -166,6 +166,11 @@ class EdgePolicy:
         self._step = 0
         self._cached_feature: Optional[torch.Tensor] = None
         self._cached_base_frame96: Optional[torch.Tensor] = None
+        # Diagnostic counter (not used by `act`'s control flow): counts how many times the
+        # `_should_refresh(...) or cache-empty` guard in `act()` actually recomputed the
+        # frozen base, for mechanically verifying cadence in an eval harness (over an
+        # S-step episode, expect `ceil(S / base_cadence)` recomputes vs. S edge calls).
+        self._base_recompute_count = 0
 
     def reset(self) -> None:
         """Resets the step counter and clears the base-feature/frame cache. Call at the
@@ -174,6 +179,7 @@ class EdgePolicy:
         self._step = 0
         self._cached_feature = None
         self._cached_base_frame96 = None
+        self._base_recompute_count = 0
 
     @torch.no_grad()
     def act(self, obs: Dict[str, Any], task_description: str) -> List[np.ndarray]:
@@ -226,6 +232,7 @@ class EdgePolicy:
             taskid = torch.zeros(1, device=self.device)
             self._cached_feature = self.proj.predict_action(hidden.to(torch.float32), taskid)  # [1, 8, 512] fp32
             self._cached_base_frame96 = obs_img_96
+            self._base_recompute_count += 1
 
         pred_chunk = self.edge(obs_img_96, self._cached_base_frame96, self._cached_feature)  # [1, 8, 7] fp32, normalized space
 

@@ -18,7 +18,16 @@ the SYNCHRONOUS (Phase-1) base -> projector -> edge action-chunk policy
 (`experiments.robot.libero.edge_policy.EdgePolicy`) is queried every 8th control step in
 place of `get_vla_action`, but the rollout loop (open-loop action queue, `process_action`
 gripper handling, requery cadence) is otherwise identical between modes -- only the action
-source differs. The two-rate async loop is Phase 2, not implemented here.
+source differs.
+
+Task 4 (Phase 2) adds `--mode async --base_cadence N`: the SAME `EdgePolicy` as `--mode
+edge`, but with `EdgeEvalConfig.base_cadence = N` -- the base's `vla_feature` is recomputed
+only every `N`th `EdgePolicy.act()` call (see `edge_policy._should_refresh`) while the edge
+still runs every call on the cached/stale feature+frame. `N=1` is `edge_cfg`-equivalent to
+`--mode edge` (base recomputed every call), though `--mode edge` itself always uses
+`base_cadence=1` regardless of `--base_cadence`. Everything else (env, obs, prompt, unnorm,
+open-loop action-queue cadence, wandb SR logging, per-job seeds) is identical across
+`stock`/`edge`/`async`.
 
 `--num_tasks` is an addition (not in the reference) to allow limiting how many of the task
 suite's tasks are run, for smoke testing.
@@ -26,6 +35,7 @@ suite's tasks are run, for smoke testing.
 
 import argparse
 import logging
+import math
 import os
 import random
 import sys
@@ -201,9 +211,14 @@ def run_episode(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stock OpenVLA-OFT LIBERO-Spatial eval harness.")
-    parser.add_argument("--mode", type=str, default="stock", choices=["stock", "edge"],
-                        help="Eval mode: 'stock' (native base action prediction) or 'edge' "
-                             "(synchronous base->projector->edge action-chunk policy, Phase-1).")
+    parser.add_argument("--mode", type=str, default="stock", choices=["stock", "edge", "async"],
+                        help="Eval mode: 'stock' (native base action prediction), 'edge' "
+                             "(synchronous base->projector->edge action-chunk policy, Phase-1), or "
+                             "'async' (same base->projector->edge policy, but the base's vla_feature "
+                             "is only recomputed every --base_cadence act() calls; Phase-2).")
+    parser.add_argument("--base_cadence", type=int, default=1,
+                         help="(--mode async only) Number of EdgePolicy.act() calls between frozen-base "
+                              "vla_feature recomputes. 1 (default) recomputes every call.")
     parser.add_argument("--task_suite_name", type=str, default="libero_spatial",
                          choices=list(TASK_MAX_STEPS.keys()), help="LIBERO task suite name.")
     parser.add_argument("--num_trials_per_task", type=int, default=50, help="Number of rollouts per task.")
@@ -232,14 +247,17 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    assert args.mode in ("stock", "edge"), f"Unknown --mode {args.mode!r}."
-    if args.mode == "edge":
-        assert args.edge_ckpt and args.proj_ckpt, "--edge_ckpt and --proj_ckpt are required for --mode edge."
+    assert args.mode in ("stock", "edge", "async"), f"Unknown --mode {args.mode!r}."
+    if args.mode in ("edge", "async"):
+        assert args.edge_ckpt and args.proj_ckpt, f"--edge_ckpt and --proj_ckpt are required for --mode {args.mode}."
 
     set_seed_everywhere(args.seed)
 
     if args.use_wandb:
-        run_name = f"{args.mode}-{args.task_suite_name}-{args.num_trials_per_task}trials"
+        if args.mode == "async":
+            run_name = f"async-N{args.base_cadence}-{args.task_suite_name}-{args.num_trials_per_task}trials"
+        else:
+            run_name = f"{args.mode}-{args.task_suite_name}-{args.num_trials_per_task}trials"
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
     resize_size = OPENVLA_IMAGE_SIZE
@@ -283,8 +301,12 @@ def main():
         def policy_reset():
             pass
 
-    else:  # args.mode == "edge"
-        # --- Load frozen base + edge adapter + action-token projector (Task 5.1) ---
+    else:  # args.mode in ("edge", "async")
+        # --- Load frozen base + edge adapter + action-token projector (Task 5.1/Phase-2) ---
+        # `--mode edge` is the Phase-1 synchronous policy (base recomputed every call,
+        # `base_cadence=1`); `--mode async` is the SAME `EdgePolicy`, but with the base's
+        # `vla_feature` recomputed only every `args.base_cadence` act() calls.
+        base_cadence = args.base_cadence if args.mode == "async" else 1
         edge_cfg = EdgeEvalConfig(
             pretrained_checkpoint=args.pretrained_checkpoint,
             use_film=False,
@@ -294,11 +316,12 @@ def main():
             load_in_4bit=False,
             lora_rank=0,
             center_crop=not args.no_center_crop,
+            base_cadence=base_cadence,
         )
         edge_policy = EdgePolicy(
             edge_cfg, task_suite_name=args.task_suite_name, edge_ckpt=args.edge_ckpt, proj_ckpt=args.proj_ckpt,
         )
-        logger.info(f"Resolved unnorm_key={edge_policy.unnorm_key!r}")
+        logger.info(f"Resolved unnorm_key={edge_policy.unnorm_key!r}, base_cadence={edge_policy.base_cadence}")
 
         def action_fn(obs, observation, task_description):
             return edge_policy.act(obs, task_description)
@@ -357,6 +380,22 @@ def main():
             if success:
                 task_successes += 1
                 total_successes += 1
+
+            if args.mode == "async":
+                # Mechanical cadence proof: over an episode with `edge_policy._step` edge
+                # calls, the base must have recomputed exactly `ceil(step / base_cadence)`
+                # times (calls 0, N, 2N, ... refresh; see `_should_refresh`).
+                steps = edge_policy._step
+                recomputes = edge_policy._base_recompute_count
+                expected = math.ceil(steps / edge_policy.base_cadence) if steps > 0 else 0
+                logger.info(
+                    f"[async cadence check] steps={steps} base_cadence={edge_policy.base_cadence} "
+                    f"base_recompute_count={recomputes} expected_ceil(steps/cadence)={expected}"
+                )
+                assert recomputes == expected, (
+                    f"Async cadence mismatch: base_recompute_count={recomputes} != "
+                    f"expected={expected} for steps={steps}, base_cadence={edge_policy.base_cadence}"
+                )
 
             if not args.no_save_video:
                 save_rollout_video(replay_images, total_episodes, success=success, task_description=task_description)
