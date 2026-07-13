@@ -116,7 +116,9 @@ class AsyncVLALiberoConfig:
                                             #   NOTE: the dataset default is 2 (smoke-only) -- training MUST
                                             #   pass a large limit or it trains on 2 episodes.
     delay_aware: bool = False               # Phase-2 delay-aware training (base sees I_{t-k}).
-    k_max: int = 15                         # Max delay k ~ Uniform{0..k_max} when delay_aware.
+    k_max: int = 3                          # ORIGINAL: lelan_dataset.py:305 -> randint(0, min(iv, 3)).
+    image_aug: bool = True                  # ORIGINAL: train_asyncvla.py:217 (image_aug=True, "HIGHLY
+                                            #   RECOMMENDED"); random crop (v=0.2, h=0.1), train only.
 
     # Training configuration
     batch_size: int = 8                     # Batch size per device
@@ -130,13 +132,15 @@ class AsyncVLALiberoConfig:
     run_root_dir: Path = Path("runs_libero")  # Path to directory to store checkpoints
     run_id_note: Optional[str] = None
 
-    # Edge adapter architecture (see `experiments.robot.libero.edge_arch.EdgeArch`). Defaults
-    # (512/2/2/4) match the historical hardcoded Phase-1 capacity; the ORIGINAL AsyncVLA runs
-    # the edge at 1024/4/4/4. `edge_arch.json` is saved alongside every checkpoint so eval can
-    # auto-detect which capacity a given checkpoint was trained at.
-    edge_obs_encoding_size: int = 512
-    edge_mha_heads: int = 2
-    edge_mha_layers: int = 2
+    # Edge adapter architecture (see `experiments.robot.libero.edge_arch.EdgeArch`). The
+    # ORIGINAL AsyncVLA runs the edge at 1024/4/4/4 (`config_nav/dataset_config.yaml`,
+    # readable via `EdgeArch.from_config_nav()`); these defaults now match it, superseding
+    # the historical hardcoded Phase-1 capacity (512/2/2/4). `edge_arch.json` is saved
+    # alongside every checkpoint so eval can auto-detect which capacity a given checkpoint
+    # was trained at.
+    edge_obs_encoding_size: int = 1024
+    edge_mha_heads: int = 4
+    edge_mha_layers: int = 4
     edge_mha_ff_dim_factor: int = 4
 
     # Logging
@@ -268,7 +272,7 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
     # Dataset / dataloader.
     dataset = LiberoSpatialDataset(
         split=cfg.split, data_dir=cfg.data_root_dir, processor=processor, episode_limit=cfg.episode_limit,
-        delay_aware=cfg.delay_aware, k_max=cfg.k_max
+        delay_aware=cfg.delay_aware, k_max=cfg.k_max, image_aug=cfg.image_aug,
     )
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=device_id, shuffle=True)
@@ -341,7 +345,9 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
 # ==============================
 
 
-def train_one_batch_smoke(num_iters: int = 200, delay_aware: bool = False, k_max: int = 15) -> List[float]:
+def train_one_batch_smoke(
+    num_iters: int = 200, delay_aware: bool = False, k_max: int = 3, image_aug: bool = False
+) -> List[float]:
     """Loads the frozen base ONCE, builds ONE fixed real batch from `LiberoSpatialDataset`
     (local shard), and runs `num_iters` forward/backward steps of edge+proj on that single
     batch. Returns the per-step L1 loss list.
@@ -366,14 +372,15 @@ def train_one_batch_smoke(num_iters: int = 200, delay_aware: bool = False, k_max
 
     # ONE fixed real batch.
     dataset = LiberoSpatialDataset(split="train", max_samples=1, processor=processor,
-                                   delay_aware=delay_aware, k_max=k_max)
+                                   delay_aware=delay_aware, k_max=k_max, image_aug=image_aug)
     item = dataset[0]
     batch = collate_libero_batch([item], pad_token_id=processor.tokenizer.pad_token_id)
 
-    # Trainable edge + projector. Seed here (last RNG-touching call before init) for a
+    # Trainable edge + projector, at the ORIGINAL AsyncVLA edge capacity (1024/4/4/4, see
+    # `EdgeArch.from_config_nav`). Seed here (last RNG-touching call before init) for a
     # reproducible init.
     torch.manual_seed(21)
-    edge, proj = build_edge_and_proj(vla.llm_dim, device)
+    edge, proj = build_edge_and_proj(vla.llm_dim, device, EdgeArch.from_config_nav())
     optimizer = AdamW(list(edge.parameters()) + list(proj.parameters()), lr=1e-4)
 
     edge.train()
