@@ -74,6 +74,8 @@ class AsyncVLALiberoConfig:
     episode_limit: int = 10_000             # Max RLDS episodes to load (LIBERO-Spatial has ~432; 10k = all).
                                             #   NOTE: the dataset default is 2 (smoke-only) -- training MUST
                                             #   pass a large limit or it trains on 2 episodes.
+    delay_aware: bool = False               # Phase-2 delay-aware training (base sees I_{t-k}).
+    k_max: int = 15                         # Max delay k ~ Uniform{0..k_max} when delay_aware.
 
     # Training configuration
     batch_size: int = 8                     # Batch size per device
@@ -217,7 +219,8 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
 
     # Dataset / dataloader.
     dataset = LiberoSpatialDataset(
-        split=cfg.split, data_dir=cfg.data_root_dir, processor=processor, episode_limit=cfg.episode_limit
+        split=cfg.split, data_dir=cfg.data_root_dir, processor=processor, episode_limit=cfg.episode_limit,
+        delay_aware=cfg.delay_aware, k_max=cfg.k_max
     )
     if world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=device_id, shuffle=True)
@@ -285,7 +288,7 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
 # ==============================
 
 
-def train_one_batch_smoke(num_iters: int = 200) -> List[float]:
+def train_one_batch_smoke(num_iters: int = 200, delay_aware: bool = False, k_max: int = 15) -> List[float]:
     """Loads the frozen base ONCE, builds ONE fixed real batch from `LiberoSpatialDataset`
     (local shard), and runs `num_iters` forward/backward steps of edge+proj on that single
     batch. Returns the per-step L1 loss list.
@@ -309,7 +312,8 @@ def train_one_batch_smoke(num_iters: int = 200) -> List[float]:
     vla, processor, proprio_projector = build_frozen_base(LiberoBaseConfig())
 
     # ONE fixed real batch.
-    dataset = LiberoSpatialDataset(split="train", max_samples=1, processor=processor)
+    dataset = LiberoSpatialDataset(split="train", max_samples=1, processor=processor,
+                                   delay_aware=delay_aware, k_max=k_max)
     item = dataset[0]
     batch = collate_libero_batch([item], pad_token_id=processor.tokenizer.pad_token_id)
 
