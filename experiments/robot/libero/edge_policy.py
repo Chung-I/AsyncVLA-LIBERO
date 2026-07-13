@@ -56,7 +56,7 @@ from PIL import Image
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
 from experiments.robot.libero.base_features import extract_actions_hidden_states
-from experiments.robot.libero.edge_arch import build_edge_and_proj, load_edge_arch
+from experiments.robot.libero.edge_arch import build_edge_and_proj, load_edge_arch, validate_edge_arch
 from experiments.robot.libero.libero_utils import get_libero_image, get_libero_wrist_image, quat2axisangle
 from experiments.robot.openvla_utils import DEVICE, normalize_proprio, prepare_images_for_vla
 from prismatic.vla.action_tokenizer import ActionTokenizer
@@ -143,11 +143,10 @@ class EdgePolicy:
         self.cfg.unnorm_key = self.unnorm_key
 
         # Auto-detect the edge architecture the checkpoint was trained with, via
-        # `edge_arch.json` saved next to it (falls back to 512/2/2/4 for Phase-1
-        # checkpoints predating `edge_arch.json` -- see `experiments.robot.libero.edge_arch`).
-        # Heads/layers are NOT recoverable from `state_dict` tensor shapes alone, so building
-        # the wrong architecture here would silently fail `load_state_dict` (or, if shapes
-        # happened to align, silently load garbage).
+        # `edge_arch.json` saved next to it -- RAISES if that file is missing (see
+        # `experiments.robot.libero.edge_arch.load_edge_arch`). Heads/layers are NOT
+        # recoverable from `state_dict` tensor shapes alone, so building the wrong
+        # architecture here would silently load garbage instead of failing `load_state_dict`.
         self.edge_arch = load_edge_arch(edge_ckpt)
         print(f"[EdgePolicy] resolved edge arch: {self.edge_arch}")
 
@@ -160,6 +159,10 @@ class EdgePolicy:
         self.proj.to(device=self.device, dtype=torch.float32)
 
         edge_state = _strip_ddp_prefix(torch.load(edge_ckpt, map_location="cpu"))
+        # Cross-check the resolved arch against what the checkpoint's weights DO reveal
+        # (obs_encoding_size, transformer layer count) before loading -- catches a stale/
+        # wrong `edge_arch.json` loudly, at load time, rather than serving garbage.
+        validate_edge_arch(self.edge_arch, edge_state)
         self.edge.load_state_dict(edge_state)
         self.edge.requires_grad_(False)
         self.edge.eval()

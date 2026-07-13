@@ -66,7 +66,7 @@ The rule for everything else is therefore:
 |---|---|---|---|
 | 1 | Edge 512/2/2, proj `action_dim=512` | **1024 / 4 heads / 4 layers / ff×4**, proj `action_dim=1024` | `config_nav/dataset_config.yaml` |
 | 2 | `k_max = 15` | **`k_max = 3`** — `k = randint(0, min(t, 3))` | `lelan_dataset.py:304` |
-| 3 | single **L1** on the chunk | **3-term weighted MSE** (§4) | `train_asyncvla.py:559` |
+| 3 | single **L1** on the chunk | **2-term weighted MSE** (§4) — their delta + trajectory terms; their 3rd ("smoothness") term is DELIBERATELY DROPPED, not reproduced (§7) | `train_asyncvla.py:552,557,559` |
 | 4 | no image augmentation | **random-crop augmentation** (`v_random=0.2`, `h_random=0.1`), shared box | `lelan_dataset.py:113-114, 363-371` |
 
 Already faithful, unchanged: frozen base + train edge & projector only (`TRAIN_BASE=False`,
@@ -77,35 +77,36 @@ training (base at `I_{t−k}`, edge `past` = `I_{t−k}`, target at `t`); closed
 ## 4. Faithful loss
 
 The original (`train_asyncvla.py:552,557,559`): the edge emits **deltas**; `delta_to_pose`
-integrates them into a waypoint trajectory; the loss penalizes both, plus smoothness, plus a
-LeLaN-only object-grounding term.
+integrates them into a waypoint trajectory; the loss penalizes both, plus a "smoothness" term,
+plus a LeLaN-only object-grounding term.
 
 ```python
 pred      = edge(obs96, past96, vla_feature)            # [B, 8, 7]  (6 EEF deltas + gripper)
 pred_traj = torch.cumsum(pred[..., :6], dim=1)          # integrated EEF trajectory  [B, 8, 6]
 gt_traj   = torch.cumsum(gt_chunk[..., :6], dim=1)
-sm_ref    = torch.cat([torch.zeros_like(pred_traj[:, :1]), pred_traj[:, :-1]], dim=1)
 
 loss = 0.5 * 15.0 * F.mse_loss(pred,      gt_chunk)     # (2) raw deltas         [their 0.5 x 15]
      + 0.5        * F.mse_loss(pred_traj, gt_traj)      # (1) integrated traj    [their 0.5]
-     + 0.1        * F.mse_loss(pred_traj, sm_ref)       # (4) smoothness         [their 0.1]
 ```
 
-**Their exact weights are kept** (`0.5`, `0.5×15 = 7.5`, `0.1`). The gripper participates **only** in
-the delta term — it is an absolute command and does not integrate. `sm_ref` mirrors
-`cat(action_orig, predicted_actions[:, 0:-1])`: the "previous predicted waypoint", with the chunk's
-first entry compared against the origin (the current EEF pose is the origin of the relative frame).
+**Their exact weights are kept** on the two remaining terms (`0.5`, `0.5×15 = 7.5`) — NOT
+renormalized after dropping the 3rd term. The gripper participates **only** in the delta term —
+it is an absolute command and does not integrate.
 
 The original masks the delta/traj terms to `~lan_bool` (non-LeLaN samples); with a single dataset
 there is no mask.
 
-**Dropped:** their 4th term `0.1 * MSE(obj_pose_norm, predicted_actions[:, -1, 0:2])` — LeLaN
-language-object grounding, no LIBERO analog (§7).
+**Dropped, not reproduced:**
+- Their 3rd term, `0.1 * MSE(sm_ref, predicted_actions)` ("smoothness") — proved to be a
+  mislabeled bug, not a fidelity gap that can be ported. See §7 for the closed-form derivation
+  and the decision to drop rather than reproduce it.
+- Their 4th term `0.1 * MSE(obj_pose_norm, predicted_actions[:, -1, 0:2])` — LeLaN
+  language-object grounding, no LIBERO analog (§7).
 
 ## 5. Faithful training configuration
 
 Frozen OpenVLA-OFT LIBERO base; train **`Edge_adapter`(1024, 4, 4, ff=4)** + **`Proj_Actiontokens`
-(`action_dim=1024`)**; `k_max = 3`; 3-term MSE; random-crop augmentation; AdamW @ `1e-4`;
+(`action_dim=1024`)**; `k_max = 3`; 2-term MSE (§4, §7 — smoothness term dropped); random-crop augmentation; AdamW @ `1e-4`; `MultiStepLR` decay (§7);
 **50k steps, batch 8, 1×H200**; checkpoints every 5k; W&B.
 
 **Random-crop port** (`lelan_dataset.py:363-371`), applied at **training only**:
@@ -149,7 +150,9 @@ to expose the cliff — itself a finding about what `k_max` buys.
 | Deviation | Why |
 |---|---|
 | `delta_to_pose` → **cumsum** over the 6 EEF dims | Original (`train_asyncvla.py:281`) is **SE(2) body-frame** composition — each delta is rotated by the accumulated heading (`dx_w = cosθ·dx − sinθ·dy`), θ accumulates. LIBERO OSC deltas are **world-frame**, so they add: cumsum is the correct analog (exact for translation; small-angle approximation for axis-angle rotation). |
-| Smoothness-term target no longer means "no motion" | `mse_smooth` is algebraically identical to `mean(pred[..., :6]**2)` — an L2 shrinkage of the normalized EEF deltas toward 0. In the original, nav actions are **scale-only** normalized, so 0 == "no motion", and the term genuinely means smoothness. LIBERO actions use **offset (`BOUNDS_Q99`) normalization** (`_bounds_q99_normalize`), so normalized-0 is the **midpoint** of `[q01, q99]` (≈ +0.096/+0.107 in raw x/y), not "no motion" — the term biases predictions toward a small constant drift rather than toward stillness. Weight is only 0.1, so impact is small, but it is embodiment-forced (a consequence of the normalization scheme, not a choice) and must be recorded rather than hidden. |
+| **Trajectory-term rotation approximation** | `cumsum` treats the 3 rotation dims (axis-angle) of the LIBERO action as a vector space, i.e. integrates them by addition. 3-D rotations don't commute in general, so this is a first-order (small-angle) approximation, not exact composition (unlike the 2-D `cosθ/sinθ` heading case above, which is exact for the translation part and only approximate for the heading itself). It holds well in practice: LIBERO's per-step rotation deltas are small — `bounds_q99` span ≈0.21–0.38 rad for the 3 rotation dims vs ≈1.5–1.9 for the 3 translation dims — so consecutive small rotations approximately commute over an 8-step chunk. |
+| **Smoothness term DROPPED — reproduces a bug, not a fidelity gap** (supersedes the earlier "Smoothness-term target no longer means 'no motion'" framing, which treated this as merely embodiment-forced; we now drop the term outright rather than adapt it) | Their term is `0.1 * MSE(sm_ref, predicted_actions)`, where `predicted_actions = delta_to_pose(deltas)` is SE(2) composition and `sm_ref` is the previous predicted pose. Writing the pose as `p_t = (x, y, cosθ, sinθ)`, the consecutive-pose difference has xy-part `R(θ_{t−1})·d_t` and heading-part with squared norm `2 − 2cos(Δθ_t)`. Because a rotation preserves norm, `‖R·d‖² = ‖d‖²`, so the whole term collapses in closed form to `nav_smooth = mean_t[dx_t² + dy_t² + 4·sin²(Δθ_t/2)]` — a pure function of the predicted DELTAS' MAGNITUDES, with no ground truth and no curvature term. It is "take small steps," NOT "don't jerk" — a mislabeled magnitude penalty. (Verified numerically against their verbatim `delta_to_pose`: 0.53007358 vs 0.53007358, exact.) Under our LIBERO `bounds_q99` OFFSET normalization it is worse than useless: normalized-zero is the MIDPOINT of `[q01, q99]`, not zero motion, so the term pulls the policy toward a constant raw drift (≈ +0.096/+0.107 in x/y) rather than toward stillness or smoothness. We drop it rather than reproduce a proven bug. |
+| **Loss weight ROLES are reversed** | In the original, WAYPOINTS are the primary supervised data (`nomad_traj_norm`, "normalized pose on robot coordinate") and the deltas are DERIVED via `pose_to_delta`; in LIBERO the DELTAS are primary (the OSC commands in the RLDS `action` field) and the trajectory is derived via `cumsum`. We kept their numeric weights (15× on delta, 0.5 on trajectory), but those weights now sit on the opposite quantities — numerically identical weights, semantically different objective. |
 | Drop `obj_pose` loss term | LeLaN language-object grounding; no LIBERO analog. |
 | Drop horizontal-flip augmentation (keep random crop) | Their flip is valid *only because they mirror the actions* (`nomad_traj_norm[:,1] = -...`, heading `sin`). Mirroring 6-DoF EEF + gripper (negate y, flip rotations about x/z, asymmetric wrist view) is error-prone. |
 | Base model: OmniVLA 8.27B → OpenVLA-OFT 7B LIBERO | Different embodiment/task. |
@@ -167,12 +170,12 @@ to expose the cliff — itself a finding about what `k_max` buys.
 | Deviation | Why |
 |---|---|
 | 50k steps / batch 8 / 1×H200 (vs 750k / 5×H200 / grad-accum 2) | ≈77 h on one GPU; ~25× smaller dataset; edge saturates by ~10k steps. |
-| LR decay 10× at 100k steps (`train_asyncvla.py:211`) never triggers | We train 50k. Moot, not removed. |
 
 **Unforced (deliberate)**
 
 | Deviation | Why |
 |---|---|
+| **`MultiStepLR` restored, milestone rescaled** | Neither LIBERO branch had ANY scheduler (flat `1e-4` throughout); the original decays the LR 10× partway through training (`train_asyncvla.py:1059-1063`: `MultiStepLR(optimizer, milestones=[cfg.num_steps_before_decay], gamma=0.1)`, with `num_steps_before_decay=100_000` of `max_steps=200_000` — i.e. at the HALFWAY point). We restore the scheduler and set `num_steps_before_decay=25_000` — half of OUR `max_steps=50_000` — preserving their 50% ratio rather than their literal `100_000` value, which would never trigger at our shorter training length. Their optional warmup (`lr_warmup_steps`, default 0) is unused in the original and is skipped. |
 | `shead`/`action_proj` trained in **fp32** → original trains in **bf16** | Original (`train_asyncvla.py:1022,1031`) casts `shead`/`action_proj` to bf16. We build/train both in fp32 (`edge_arch.py:103-104`). Not embodiment-forced — a deliberate choice (numerical headroom for a from-scratch small head on ~25x less data), recorded here so it isn't mistaken for an oversight. |
 | Original nav code paths no longer runnable on this branch | The inherited LIBERO retarget of `prismatic/vla/constants.py` (`ACTION_DIM`/`POSE_DIM` 4 → 7, commit `7954582`) means the ORIGINAL nav code paths (`vla-scripts/train_asyncvla.py`, `inference/run_asyncvla.py`) are no longer runnable on this branch: `Proj_Actiontokens` (`prismatic/models/small_head.py:233`) builds `MLPResNet_idcat(input_dim=4096*7=28672)` where the released nav `action_proj` checkpoint expects `4096*4=16384`. `Edge_adapter`'s own `shead` checkpoint DOES still load (its head defaults to the nav width 4 → 32). This is accepted: the fork is LIBERO-only. It is recorded here because the minimal-delta method's premise is that the original code is present and working, and for the nav path that is now only partly true. |
 
@@ -188,7 +191,7 @@ to expose the cliff — itself a finding about what `k_max` buys.
   default) so no caller can silently fall back to the unfaithful 512/2/2/4 capacity.
 - `prismatic/vla/datasets/libero_dataset.py` — random-crop augmentation (shared box, train-only);
   `k_max` default **3**.
-- `vla-scripts/train_asyncvla_libero.py` — the 3-term MSE loss (§4); `k_max` default 3; `--image_aug`.
+- `vla-scripts/train_asyncvla_libero.py` — the 2-term MSE loss (§4, §7); `k_max` default 3; `--image_aug`; `MultiStepLR` decay (§7).
 - `experiments/robot/libero/run_libero_eval.py`, `edge_policy.py`, `latency_bench.py` — **unchanged**
   (already faithful; `latency_bench` picks up the new capacity via `EdgeArch`).
 - `docs/superpowers/notes/faithful-results.md` — the deliverable write-up.
@@ -200,14 +203,15 @@ to expose the cliff — itself a finding about what `k_max` buys.
 - **Unit:** delay sampler with `k_max=3` — `k ∈ {0..3}`, clamped at episode start.
 - **Unit:** random crop — **one box per sample** shared across base/wrist/both edge frames; the crop
   is **off** at eval.
-- **Unit:** the 3-term loss — each term's weight; the gripper is excluded from the traj/smoothness
-  terms; gradients reach edge + projector only.
+- **Unit:** the 2-term loss — each term's weight; the gripper is excluded from the traj term;
+  gradients reach edge + projector only.
+- **Unit:** `MultiStepLR` — LR is `1e-4` before `cfg.num_steps_before_decay` and `1e-5` after.
 - **Integration:** delay-aware overfit at the faithful config (loss drops well below half).
 - **Smoke:** 1 async episode at `N = 3` (in-distribution), end-to-end, valid `[8,7]` chunks.
 
 ## 10. Risks
 
-1. **The 3-term MSE may train differently than L1.** The `7.5 ×` delta weight is large; if training is
+1. **The 2-term MSE may train differently than L1.** The `7.5 ×` delta weight is large; if training is
    unstable, that is a *finding* about the original's recipe under a different embodiment — report it,
    do not silently retune. (Their weights are kept exactly, per decision.)
 2. **`k_max = 3` caps usable cadence at ~4.** Expected — and the N=6,8 points are there to show it.

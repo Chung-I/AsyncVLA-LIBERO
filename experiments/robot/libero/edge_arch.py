@@ -21,19 +21,25 @@ saves `edge_arch.json` next to each checkpoint) and `experiments/robot/libero/ed
 (which loads `edge_arch.json` to rebuild the exact same architecture before `load_state_dict`)
 import from, so the two code paths cannot drift.
 
-Backward compatibility (MANDATORY): checkpoints saved before this module existed (all
-current Phase-1 checkpoints and any run already in flight) have NO `edge_arch.json` next to
-them. `load_edge_arch` treats that as "trained at the historical defaults" and returns
-`EdgeArch()` (512/2/2/4) -- so old checkpoints keep loading exactly as they did before this
-change.
+No silent fallback (MANDATORY): `mha_num_attention_heads` is the ONE arch field that leaves
+NO fingerprint in the weights -- `nn.MultiheadAttention` stores `in_proj_weight` as
+`[3*embed_dim, embed_dim]`, a shape independent of `num_heads`. A checkpoint trained at 4
+heads loads CLEANLY (no shape error) into a module built with 2 heads, and silently computes
+attention with the wrong head split -- no exception, no NaN, just quietly wrong outputs. So
+`load_edge_arch` does NOT guess a default when `edge_arch.json` is missing: it raises,
+telling the caller to pass the arch explicitly (`load_edge_arch(ckpt_path, arch=...)`).
+`validate_edge_arch` closes the other half of the gap: it cross-checks an `EdgeArch` against
+what the checkpoint's weights DO reveal (`obs_encoding_size`, transformer layer count) and
+raises loudly on a mismatch, so `EdgePolicy` fails at load time rather than serving garbage.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
@@ -42,17 +48,20 @@ from prismatic.vla.constants import ACTION_DIM
 
 EDGE_ARCH_FILENAME = "edge_arch.json"
 
+_SA_LAYER_INDEX_RE = re.compile(r"^decoder\.sa_decoder\.layers\.(\d+)\.")
+
 
 @dataclass
 class EdgeArch:
     """Edge adapter capacity. Defaults (512/2/2/4) match the historical hardcoded values
     used by every Phase-1 checkpoint trained before this module existed.
 
-    DELIBERATELY LEFT AS-IS: these are the back-compat contract `load_edge_arch` relies on
-    for checkpoints with no `edge_arch.json` (see that function's docstring) -- do NOT
-    change them to the faithful 1024/4/4/4 capacity just because `build_edge_and_proj`'s
-    `arch` parameter below became required; that argument is unrelated to this class's own
-    field defaults."""
+    DELIBERATELY LEFT AS-IS: kept as the documented historical Phase-1 capacity, and as a
+    convenient literal for tests -- do NOT change them to the faithful 1024/4/4/4 capacity
+    just because `build_edge_and_proj`'s `arch` parameter below became required; that
+    argument is unrelated to this class's own field defaults. NOTE: `load_edge_arch` no
+    longer falls back to these defaults when `edge_arch.json` is missing (it raises
+    instead, see that function's docstring) -- the head count cannot be safely guessed."""
 
     obs_encoding_size: int = 512
     mha_num_attention_heads: int = 2
@@ -118,15 +127,74 @@ def save_edge_arch(run_dir: Union[str, Path], arch: EdgeArch) -> None:
         json.dump(asdict(arch), f, indent=2)
 
 
-def load_edge_arch(ckpt_path: Union[str, Path]) -> EdgeArch:
+def load_edge_arch(ckpt_path: Union[str, Path], arch: Optional[EdgeArch] = None) -> EdgeArch:
     """Reads `edge_arch.json` from `ckpt_path`'s PARENT directory (i.e. the run directory a
-    checkpoint file like `shead--50000_checkpoint.pt` lives in). Falls back to `EdgeArch()`
-    (512/2/2/4) if the file is absent -- BACKWARD COMPAT for checkpoints saved before
-    `edge_arch.json` existed.
+    checkpoint file like `shead--50000_checkpoint.pt` lives in).
+
+    If `arch` is given explicitly, it is returned as-is and the json is never consulted --
+    the escape hatch for callers who already know the correct architecture.
+
+    Otherwise, RAISES `FileNotFoundError` if `edge_arch.json` is absent, rather than
+    silently falling back to `EdgeArch()`'s 512/2/2/4 defaults. `mha_num_attention_heads`
+    cannot be recovered from a checkpoint's tensor shapes (`nn.MultiheadAttention` stores
+    `in_proj_weight` as `[3*embed_dim, embed_dim]`, independent of `num_heads`), so a wrong
+    guess would load the checkpoint's weights CLEANLY -- no shape error -- while silently
+    computing attention with the wrong head split. Guessing is therefore strictly worse than
+    failing loudly here.
     """
+    if arch is not None:
+        return arch
     arch_path = Path(ckpt_path).parent / EDGE_ARCH_FILENAME
     if not arch_path.exists():
-        return EdgeArch()
+        raise FileNotFoundError(
+            f"No {EDGE_ARCH_FILENAME} found next to checkpoint {str(ckpt_path)!r} (expected "
+            f"at {str(arch_path)!r}). The edge adapter's head count "
+            "(`mha_num_attention_heads`) cannot be recovered from the checkpoint's tensor "
+            "shapes, so it cannot be safely guessed. Pass the correct architecture "
+            "explicitly, e.g. `load_edge_arch(ckpt_path, arch=EdgeArch(...))`."
+        )
     with open(arch_path, "r") as f:
         data = json.load(f)
     return EdgeArch(**data)
+
+
+def validate_edge_arch(arch: EdgeArch, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Cross-checks `arch` against what `state_dict` (an `Edge_adapter.state_dict()`) DOES
+    reveal, raising `ValueError` on a mismatch. Does NOT (cannot) check
+    `mha_num_attention_heads` -- see the module docstring -- so a caller must obtain `arch`
+    from a trustworthy source (`edge_arch.json`, written at save time by the same run that
+    produced the checkpoint) rather than guessing.
+
+    Checks:
+      - `embed_dim`, inferred from a `decoder.sa_decoder.layers.*.self_attn.in_proj_weight`
+        shape (`[3*embed_dim, embed_dim]` -> `embed_dim = shape[1]`), must equal
+        `arch.obs_encoding_size`.
+      - the number of transformer layers, inferred by counting distinct
+        `decoder.sa_decoder.layers.<N>.` indices present in `state_dict`, must equal
+        `arch.mha_num_attention_layers`.
+    """
+    layer_indices = {
+        int(m.group(1)) for k in state_dict if (m := _SA_LAYER_INDEX_RE.match(k)) is not None
+    }
+    if not layer_indices:
+        raise ValueError(
+            "state_dict has no 'decoder.sa_decoder.layers.<N>.*' keys -- is this really an "
+            "Edge_adapter state_dict?"
+        )
+
+    in_proj_key = f"decoder.sa_decoder.layers.{min(layer_indices)}.self_attn.in_proj_weight"
+    embed_dim = state_dict[in_proj_key].shape[1]
+    if embed_dim != arch.obs_encoding_size:
+        raise ValueError(
+            f"edge_arch mismatch: state_dict's {in_proj_key!r} shape "
+            f"{tuple(state_dict[in_proj_key].shape)} implies embed_dim={embed_dim}, but "
+            f"arch.obs_encoding_size={arch.obs_encoding_size}."
+        )
+
+    num_layers = len(layer_indices)
+    if num_layers != arch.mha_num_attention_layers:
+        raise ValueError(
+            f"edge_arch mismatch: state_dict has {num_layers} 'decoder.sa_decoder.layers.*' "
+            f"transformer layers, but arch.mha_num_attention_layers="
+            f"{arch.mha_num_attention_layers}."
+        )

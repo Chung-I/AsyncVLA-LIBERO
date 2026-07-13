@@ -12,7 +12,8 @@ Structure mirrors `vla-scripts/train_asyncvla.py` (config dataclass, DDP init vi
     `(vla, processor, proprio_projector)`. Never trained; no LoRA.
   - Per-step forward: `extract_actions_hidden_states` (base, no_grad) ->
     `proj.predict_action` -> `edge(obs_img_96, past_img_96, vla_feature)`.
-  - Loss: `faithful_chunk_loss` (3-term weighted MSE: 0.5*15*delta + 0.5*traj + 0.1*smooth).
+  - Loss: `faithful_chunk_loss` (2-term weighted MSE: 0.5*15*delta + 0.5*traj; the original's
+    3rd "smoothness" term is deliberately dropped -- see the function docstring).
   - Trainable params: `Edge_adapter` ("shead") + `Proj_Actiontokens` ("proj") only.
 
 CLI entrypoint (torchrun-compatible):
@@ -46,6 +47,7 @@ import wandb
 from accelerate import PartialState
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -72,31 +74,47 @@ NUM_EEF_DIMS = ACTION_DIM - 1  # 6
 
 
 def faithful_chunk_loss(pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """AsyncVLA's 3-term weighted MSE, mirroring `vla-scripts/train_asyncvla.py:552,557,559`.
+    """AsyncVLA's 2-term weighted MSE, mirroring `vla-scripts/train_asyncvla.py:552,557` (the
+    delta and trajectory terms). Their 3rd term ("smoothness", `:559`) is DELIBERATELY
+    DROPPED -- it is a mislabeled bug, not a fidelity gap, and we must not reproduce it. The
+    4th term (0.1 * MSE on the LeLaN object pose) has no LIBERO analog and was already
+    dropped.
+
+    Why the smoothness term is dropped (closed-form derivation):
+
+    The original's term is `0.1 * MSE(sm_ref, predicted_actions)`, where
+    `predicted_actions = delta_to_pose(deltas)` is SE(2) composition and `sm_ref` is the
+    previous predicted pose. Writing the pose as `p_t = (x, y, cosθ, sinθ)`, the
+    consecutive-pose difference has xy-part `R(θ_{t−1})·d_t` and heading-part with squared
+    norm `2 − 2cos(Δθ_t)`. Because a rotation preserves norm, `‖R·d‖² = ‖d‖²`, so the whole
+    term collapses in closed form to:
+
+        nav_smooth = mean_t [ dx_t² + dy_t² + 4·sin²(Δθ_t/2) ]
+
+    i.e. a pure function of the predicted DELTAS' MAGNITUDES -- no ground truth, no
+    curvature. It is "take small steps," NOT "don't jerk." (Verified numerically against
+    the original's verbatim `delta_to_pose`: 0.53007358 vs 0.53007358, exact.) Under our
+    LIBERO `bounds_q99` OFFSET normalization it is worse than useless: normalized-zero is
+    the MIDPOINT of [q01,q99], not zero motion, so the term pulls the policy toward a
+    constant raw drift (≈ +0.096/+0.107 in x/y). We therefore drop it rather than reproduce
+    a bug.
 
     The original edge emits DELTAS and `delta_to_pose` integrates them into a waypoint
-    trajectory; the loss penalizes the deltas (weight 0.5*15), the integrated trajectory
-    (0.5) and the trajectory's smoothness (0.1). Their `delta_to_pose` is SE(2) body-frame
-    composition (nav-only); LIBERO's OSC deltas are world-frame, so `cumsum` is the analog.
-    Their 4th term (0.1 * MSE on the LeLaN object pose) has no LIBERO analog and is dropped.
+    trajectory; the loss penalizes the deltas (weight 0.5*15) and the integrated trajectory
+    (0.5). Their `delta_to_pose` is SE(2) body-frame composition (nav-only); LIBERO's OSC
+    deltas are world-frame, so `cumsum` is the analog.
     """
     pred_traj = torch.cumsum(pred[..., :NUM_EEF_DIMS], dim=1)
     gt_traj = torch.cumsum(gt[..., :NUM_EEF_DIMS], dim=1)
-    # sm_ref mirrors `cat(action_orig, predicted_actions[:, 0:-1])`: the previous predicted
-    # waypoint, with the chunk's first entry compared against the origin (the current EEF
-    # pose is the origin of this relative frame). NOT detached -- matching the original.
-    sm_ref = torch.cat([torch.zeros_like(pred_traj[:, :1]), pred_traj[:, :-1]], dim=1)
 
     mse_delta = F.mse_loss(pred, gt)
     mse_traj = F.mse_loss(pred_traj, gt_traj)
-    mse_smooth = F.mse_loss(pred_traj, sm_ref)
 
-    loss = 0.5 * 15.0 * mse_delta + 0.5 * mse_traj + 0.1 * mse_smooth
+    loss = 0.5 * 15.0 * mse_delta + 0.5 * mse_traj
     metrics = {
         "loss": loss.item(),
         "mse_delta": mse_delta.item(),
         "mse_traj": mse_traj.item(),
-        "mse_smooth": mse_smooth.item(),
     }
     return loss, metrics
 
@@ -124,6 +142,11 @@ class AsyncVLALiberoConfig:
     batch_size: int = 8                     # Batch size per device
     learning_rate: float = 1e-4
     max_steps: int = 50_000
+    num_steps_before_decay: int = 25_000    # ORIGINAL: train_asyncvla.py:211 ("100_000" of
+                                            #   `max_steps=200_000`, i.e. at the HALFWAY point);
+                                            #   25k is half of OUR `max_steps=50_000`, preserving
+                                            #   their ratio rather than their literal 100k.
+    lr_decay_gamma: float = 0.1             # ORIGINAL: train_asyncvla.py:1061 (MultiStepLR gamma).
     save_freq: int = 5_000                  # Checkpoint saving frequency in steps
     num_workers: int = 0                    # 0 = load in the main process. num_workers>0 forks AFTER the
                                             #   frozen base + TensorFlow are initialized, which deadlocks
@@ -268,6 +291,12 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
     trainable_params = list(edge.parameters()) + list(proj.parameters())
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    # ORIGINAL: train_asyncvla.py:1059-1063 -- a single 10x LR decay at the halfway point of
+    # training (`num_steps_before_decay=100_000` of `max_steps=200_000`). Neither LIBERO
+    # branch had ANY scheduler before this; `cfg.num_steps_before_decay` defaults to 25k,
+    # half of our `max_steps=50_000`, preserving their ratio. Their optional warmup
+    # (`lr_warmup_steps`) defaults to 0 (unused) and is skipped here.
+    scheduler = MultiStepLR(optimizer, milestones=[cfg.num_steps_before_decay], gamma=cfg.lr_decay_gamma)
 
     # Dataset / dataloader.
     dataset = LiberoSpatialDataset(
@@ -312,6 +341,7 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                scheduler.step()
 
                 recent_losses.append(metrics["loss"])
                 progress.update()
@@ -321,7 +351,7 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
                         "train/loss": sum(recent_losses) / len(recent_losses),
                         "train/mse_delta": metrics["mse_delta"],
                         "train/mse_traj": metrics["mse_traj"],
-                        "train/mse_smooth": metrics["mse_smooth"],
+                        "train/learning_rate": scheduler.get_last_lr()[0],
                     }, step=step)
 
                 if step > 0 and step % cfg.save_freq == 0:
