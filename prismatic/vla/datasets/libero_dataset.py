@@ -351,7 +351,8 @@ class LiberoSpatialDataset(Dataset):
         # (eval/Phase-1) path stays byte-identical. `_last_crop_offsets` records the single
         # shared box of the most recent `__getitem__` call, for test inspection.
         self.image_aug = image_aug
-        self._aug_rng = np.random.RandomState(rng_seed)
+        if self.image_aug:
+            self._aug_rng = np.random.RandomState(rng_seed)
         self._last_crop_offsets: Tuple[int, int] = (0, 0)
 
         # Delay-aware sampling (Phase 2): when enabled, the BASE is trained/evaluated on a
