@@ -25,9 +25,15 @@ edge`, but with `EdgeEvalConfig.base_cadence = N` -- the base's `vla_feature` is
 only every `N`th `EdgePolicy.act()` call (see `edge_policy._should_refresh`) while the edge
 still runs every call on the cached/stale feature+frame. `N=1` is `edge_cfg`-equivalent to
 `--mode edge` (base recomputed every call), though `--mode edge` itself always uses
-`base_cadence=1` regardless of `--base_cadence`. Everything else (env, obs, prompt, unnorm,
-open-loop action-queue cadence, wandb SR logging, per-job seeds) is identical across
-`stock`/`edge`/`async`.
+`base_cadence=1` regardless of `--base_cadence`. Unlike `stock`/`edge` (open-loop: query
+once, execute the full 8-action chunk, requery every 8 env steps), `--mode async` is
+CLOSED-LOOP, matching the original AsyncVLA control loop (`../AsyncVLA/inference/
+run_asyncvla.py`, paper Algorithm 1): `EdgePolicy.act()` is called at EVERY env step and
+only `actions[0]` (receding horizon) is executed, so `EdgePolicy._step` counts env steps and
+`base_cadence=N` means the base recomputes every `N` env steps -- staleness `k = 0..N-1`
+frames, matching the delay-aware edge's training (`k ~ U{0..15}`). Everything else (env,
+obs, prompt, unnorm, wandb SR logging, per-job seeds) is identical across `stock`/`edge`/
+`async`; `stock`/`edge` still use the open-loop action queue byte-for-byte unchanged.
 
 `--num_tasks` is an addition (not in the reference) to allow limiting how many of the task
 suite's tasks are run, for smoke testing.
@@ -163,21 +169,32 @@ def run_episode(
     initial_state,
     num_steps_wait: int,
     max_steps: int,
+    open_loop: bool = True,
 ):
-    """Run a single open-loop episode: requery the policy every 8 steps
-    (NUM_ACTIONS_CHUNK), executing its parallel-decoded action chunk.
+    """Run a single episode in either of two execution modes, selected by `open_loop`:
+
+    - `open_loop=True` (`--mode stock`/`--mode edge`, UNCHANGED from Task 3.1/5.1): requery
+      the policy every 8 steps (NUM_ACTIONS_CHUNK) via an `action_queue`, executing its
+      full parallel-decoded action chunk before requerying.
+    - `open_loop=False` (`--mode async`, Task 4/Phase 2): CLOSED-LOOP, matching the original
+      AsyncVLA control loop (`../AsyncVLA/inference/run_asyncvla.py`, paper Algorithm 1):
+      `action_fn` (`EdgePolicy.act`) is called at EVERY control step on the current frame,
+      and only the first action of the returned chunk (`actions[0]`, receding horizon) is
+      executed -- no `action_queue`. This makes `EdgePolicy._step` count env steps, so
+      `base_cadence=N` means the base recomputes every `N` env steps (staleness `k =
+      0..N-1` frames), matching the delay-aware edge's training.
 
     `action_fn(obs, observation, task_description) -> List[np.ndarray]` is the mode's
     action source (`get_vla_action` for `--mode stock`, `EdgePolicy.act` for `--mode
-    edge`); `policy_reset()` is called once per episode (a no-op for stock, clears the
-    edge's 1-frame agentview history for edge) -- everything else (open-loop cadence,
-    `process_action` gripper handling, `num_steps_wait`) is identical between modes.
+    edge`/`--mode async`); `policy_reset()` is called once per episode (a no-op for stock,
+    clears the edge's cached base feature/frame for edge/async) -- everything else
+    (`process_action` gripper handling, `num_steps_wait`) is identical across modes.
     """
     env.reset()
     obs = env.set_init_state(initial_state)
     policy_reset()
 
-    action_queue = deque(maxlen=8)
+    action_queue = deque(maxlen=8) if open_loop else None
     t = 0
     replay_images = []
     success = False
@@ -191,11 +208,18 @@ def run_episode(
             observation, img = prepare_observation(obs, resize_size)
             replay_images.append(img)
 
-            if len(action_queue) == 0:
-                actions = action_fn(obs, observation, task_description)
-                action_queue.extend(actions)
+            if open_loop:
+                if len(action_queue) == 0:
+                    actions = action_fn(obs, observation, task_description)
+                    action_queue.extend(actions)
 
-            action = action_queue.popleft()
+                action = action_queue.popleft()
+            else:
+                # Closed-loop (async): re-query the policy every control step and execute
+                # only the first (receding-horizon) action of the returned chunk.
+                actions = action_fn(obs, observation, task_description)
+                action = actions[0]
+
             action = process_action(action)
 
             obs, reward, done, info = env.step(action.tolist())
@@ -373,6 +397,7 @@ def main():
             success, replay_images = run_episode(
                 env, task_description, action_fn, policy_reset,
                 resize_size, initial_state, args.num_steps_wait, max_steps,
+                open_loop=(args.mode != "async"),
             )
 
             task_episodes += 1
@@ -382,9 +407,12 @@ def main():
                 total_successes += 1
 
             if args.mode == "async":
-                # Mechanical cadence proof: over an episode with `edge_policy._step` edge
-                # calls, the base must have recomputed exactly `ceil(step / base_cadence)`
-                # times (calls 0, N, 2N, ... refresh; see `_should_refresh`).
+                # Mechanical cadence proof: with the closed-loop path (`open_loop=False`),
+                # `EdgePolicy.act` is called once per post-wait env step, so
+                # `edge_policy._step == post_wait_env_steps`. Over those `steps` calls, the
+                # base must have recomputed exactly `ceil(steps / base_cadence)` times
+                # (calls 0, N, 2N, ... refresh; see `_should_refresh`) -- staleness
+                # `k = 0..N-1` frames, matching the delay-aware edge's training.
                 steps = edge_policy._step
                 recomputes = edge_policy._base_recompute_count
                 expected = math.ceil(steps / edge_policy.base_cadence) if steps > 0 else 0
