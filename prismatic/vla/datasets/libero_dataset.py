@@ -238,6 +238,11 @@ def build_base_item(
     )
 
 
+def _sample_delay(t: int, k_max: int, rng: "np.random.RandomState") -> int:
+    """Delay k for delay-aware training: Uniform{0..k_max}, clamped so t-k >= 0."""
+    return int(min(rng.randint(0, k_max + 1), t))
+
+
 def _has_tfrecords(data_dir: Path) -> bool:
     return data_dir.is_dir() and any(data_dir.glob("*.tfrecord-*"))
 
@@ -307,10 +312,21 @@ class LiberoSpatialDataset(Dataset):
         processor=None,
         episode_limit: int = 2,
         predict_stop_token: bool = True,
+        delay_aware: bool = False,
+        k_max: int = 15,
+        rng_seed: int = 0,
     ) -> None:
         self.predict_stop_token = predict_stop_token
         self.processor = processor if processor is not None else load_processor()
         self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
+
+        # Delay-aware sampling (Phase 2): when enabled, the BASE is trained/evaluated on a
+        # stale frame `t - k` instead of the current frame `t` (see `_sample_delay` /
+        # `__getitem__`). Disabled by default so Phase-1 behavior is unchanged byte-for-byte.
+        self.delay_aware = delay_aware
+        self.k_max = k_max
+        if self.delay_aware:
+            self._delay_rng = np.random.RandomState(rng_seed)
 
         self._action_stats: Optional[Dict[str, Any]] = None
         self._proprio_stats: Optional[Dict[str, Any]] = None
@@ -348,25 +364,44 @@ class LiberoSpatialDataset(Dataset):
         ep_idx, t = self._index[idx]
         ep = self._episodes[ep_idx]
 
+        # Base timestep: `t - k` when delay-aware (the base processes a stale frame), else
+        # `t` -- the unchanged Phase-1 path. `t_base` drives ALL base-model construction
+        # (image/wrist/proprio/teacher-forced action tokens) below; the edge's current frame
+        # and the target `gt_action_chunk` always stay at `t`.
+        if self.delay_aware:
+            k = _sample_delay(t, self.k_max, self._delay_rng)
+            t_base = t - k
+        else:
+            t_base = t  # Phase-1 behavior unchanged
+
         primary_now = Image.fromarray(ep["image"][t])
-        primary_prev = Image.fromarray(ep["image"][t - 1]) if t > 0 else primary_now
+        if self.delay_aware:
+            primary_prev = Image.fromarray(ep["image"][t_base])  # edge "past" = base's frame I_{t-k}
+        else:
+            primary_prev = Image.fromarray(ep["image"][t - 1]) if t > 0 else primary_now
 
         # Base-model images ONLY: resize-to-224 + center-crop to match the eval/stock path
-        # bit-for-bit (see `_to_base_image`). The 96px edge frames built below from
-        # `primary_now`/`primary_prev` stay uncropped on both training and eval.
-        base_primary_image = _to_base_image(ep["image"][t])
-        base_wrist_image = _to_base_image(ep["wrist_image"][t])
+        # bit-for-bit (see `_to_base_image`), built from `t_base`. The 96px edge frames built
+        # below from `primary_now`/`primary_prev` stay uncropped on both training and eval.
+        base_primary_image = _to_base_image(ep["image"][t_base])
+        base_wrist_image = _to_base_image(ep["wrist_image"][t_base])
 
-        proprio_raw = np.asarray(ep["state"][t], dtype=np.float32)
+        proprio_raw = np.asarray(ep["state"][t_base], dtype=np.float32)
         proprio = _bounds_q99_normalize(proprio_raw, self._proprio_stats) if self._proprio_stats else proprio_raw
 
-        action_chunk_raw = np.stack(ep["action"][t : t + NUM_ACTIONS_CHUNK]).astype(np.float32)
-        # Replicate the OXE `libero_dataset_transform` standardization (gripper convention
-        # fix) that the frozen checkpoint was trained through, BEFORE normalization/tokenization.
-        action_chunk_raw = _apply_libero_action_transform(action_chunk_raw)
-        action_chunk = (
-            _bounds_q99_normalize(action_chunk_raw, self._action_stats) if self._action_stats else action_chunk_raw
-        )
+        def _build_action_chunk(start: int) -> np.ndarray:
+            raw = np.stack(ep["action"][start : start + NUM_ACTIONS_CHUNK]).astype(np.float32)
+            # Replicate the OXE `libero_dataset_transform` standardization (gripper
+            # convention fix) that the frozen checkpoint was trained through, BEFORE
+            # normalization/tokenization.
+            raw = _apply_libero_action_transform(raw)
+            return _bounds_q99_normalize(raw, self._action_stats) if self._action_stats else raw
+
+        # Target ("now") chunk: unchanged from Phase 1, always the chunk starting at `t`.
+        action_chunk = _build_action_chunk(t)
+        # Base's teacher-forced chunk: starts at `t_base` (== `t`, i.e. identical to
+        # `action_chunk`, when delay_aware=False).
+        base_action_chunk = action_chunk if t_base == t else _build_action_chunk(t_base)
 
         task_label = ep["language_instruction"]
 
@@ -377,7 +412,7 @@ class LiberoSpatialDataset(Dataset):
             primary_image=base_primary_image,
             wrist_image=base_wrist_image,
             proprio=proprio,
-            action_chunk=action_chunk,
+            action_chunk=base_action_chunk,
             predict_stop_token=self.predict_stop_token,
         )
         item["obs_img_96"] = _to_edge_frame(primary_now)
