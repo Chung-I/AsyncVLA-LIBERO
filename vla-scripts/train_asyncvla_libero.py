@@ -13,7 +13,7 @@ Structure mirrors `vla-scripts/train_asyncvla.py` (config dataclass, DDP init vi
   - Per-step forward: `extract_actions_hidden_states` (base, no_grad) ->
     `proj.predict_action` -> `edge(obs_img_96, past_img_96, vla_feature)`.
   - Loss: `faithful_chunk_loss` (3-term weighted MSE: 0.5*15*delta + 0.5*traj + 0.1*smooth).
-  - Trainable params: `Edge_adapter_manip` ("shead") + `Proj_Actiontokens` ("proj") only.
+  - Trainable params: `Edge_adapter` ("shead") + `Proj_Actiontokens` ("proj") only.
 
 CLI entrypoint (torchrun-compatible):
 
@@ -208,7 +208,7 @@ def run_forward_pass(
         vla, batch, proprio_projector, num_patches=NUM_BASE_PATCHES, device=device
     )  # [B, 56, 4096] bfloat16, no grad
 
-    vla_feature = proj.predict_action(hidden.to(torch.float32), taskid)  # [B, 8, 512] fp32
+    vla_feature = proj.predict_action(hidden.to(torch.float32), taskid)  # [B, 8, 1024] fp32 (faithful width)
 
     obs_img_96 = batch["obs_img_96"].to(device=device, dtype=torch.float32)
     past_img_96 = batch["past_img_96"].to(device=device, dtype=torch.float32)
@@ -294,7 +294,7 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
         drop_last=True,
     )
 
-    recent_l1 = deque(maxlen=cfg.wandb_log_freq)
+    recent_losses = deque(maxlen=cfg.wandb_log_freq)
     edge.train()
     proj.train()
 
@@ -313,12 +313,12 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
                 loss.backward()
                 optimizer.step()
 
-                recent_l1.append(metrics["loss"])
+                recent_losses.append(metrics["loss"])
                 progress.update()
 
                 if distributed_state.is_main_process and step % cfg.wandb_log_freq == 0:
                     wandb.log({
-                        "train/loss": sum(recent_l1) / len(recent_l1),
+                        "train/loss": sum(recent_losses) / len(recent_losses),
                         "train/mse_delta": metrics["mse_delta"],
                         "train/mse_traj": metrics["mse_traj"],
                         "train/mse_smooth": metrics["mse_smooth"],
@@ -350,13 +350,13 @@ def train_one_batch_smoke(
 ) -> List[float]:
     """Loads the frozen base ONCE, builds ONE fixed real batch from `LiberoSpatialDataset`
     (local shard), and runs `num_iters` forward/backward steps of edge+proj on that single
-    batch. Returns the per-step L1 loss list.
+    batch. Returns the per-step `faithful_chunk_loss` (3-term weighted MSE) list.
 
     Single-process, single-GPU: does NOT use `torchrun`/DDP/`accelerate.PartialState`, and
     does NOT touch wandb. Used by `tests/test_train_overfit.py`.
 
     Robustness comes from the iteration count, not a cherry-picked seed: a 3-seed sweep
-    under deterministic cuDNN gives final/initial L1 ratios of ~0.51-0.55 at 50 iters
+    under deterministic cuDNN gives final/initial loss ratios of ~0.51-0.55 at 50 iters
     (flaky vs the 0.5 bar), ~0.10-0.13 at 150 iters, and ~0.03-0.05 at 300 iters. The
     200-iter default clears the "< 0.5x initial loss" bar with a wide margin for any seed;
     the fixed `torch.manual_seed` below only makes the trajectory reproducible run-to-run.

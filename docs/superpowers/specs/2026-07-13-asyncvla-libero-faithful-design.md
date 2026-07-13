@@ -31,12 +31,20 @@ unmodified (`prismatic/models/small_head.py`, `prismatic/vla/datasets/*`,
 rule is therefore:
 
 1. **Call the original classes directly.** Use the original **`Edge_adapter`** — not a duplicate.
-   It needs exactly **one line**: `nn.Linear(64, 8 * 4)` → `nn.Linear(64, NUM_ACTIONS_CHUNK *
-   ACTION_DIM)`. This is a **semantic no-op for navigation** (chunk=8, `ACTION_DIM`=4 → 32,
-   identical) and under our LIBERO constants (`ACTION_DIM=7`) it yields 8×7 automatically; the
-   reshape already uses `(NUM_ACTIONS_CHUNK, -1)` and adapts for free. **Retire
-   `Edge_adapter_manip`** (it was only ever `Edge_adapter` with that output parametrized).
-   `Proj_Actiontokens` and `MultiLayerDecoder_trans` are already used unmodified.
+   Its output head width becomes a constructor parameter: `nn.Linear(64, 8 * 4)` →
+   `nn.Linear(64, NUM_ACTIONS_CHUNK * action_dim)`, with `action_dim: int = 4` defaulting to the
+   original nav width so every existing original caller (`train_asyncvla.py`,
+   `run_asyncvla.py`, neither of which ever passes `action_dim`) is byte-identical to before —
+   `NUM_ACTIONS_CHUNK * 4 == 8 * 4 == 32`. **This is NOT a no-op under `prismatic/vla/constants.py`'s
+   `ACTION_DIM`** — that constant is `7` (the LIBERO value; there is no
+   `ACTION_DIM=4` anywhere in this codebase), so hardcoding `NUM_ACTIONS_CHUNK * ACTION_DIM`
+   would silently build a 56-wide head for the original nav callers too and break both
+   `train_asyncvla.py`'s loss (shape mismatch against the 4-D `daction_ref`) and
+   `run_asyncvla.py`'s checkpoint load (`[32,64]` vs `[56,64]`). The LIBERO path instead passes
+   `action_dim=ACTION_DIM` (=7) **explicitly**, via `build_edge_and_proj`. The reshape at the
+   end of `forward` already uses `(NUM_ACTIONS_CHUNK, -1)` and adapts for free either way.
+   **Retire `Edge_adapter_manip`** (it was only ever `Edge_adapter` with that output
+   parametrized). `Proj_Actiontokens` and `MultiLayerDecoder_trans` are already used unmodified.
 2. **Read the original's hyperparameters from the original files** — edge capacity straight from
    `config_nav/dataset_config.yaml` (the same file `train_asyncvla.py` reads).
 3. **Add LIBERO-only code** only where the original has *no counterpart* (base loading, eval
@@ -134,6 +142,7 @@ to expose the cliff — itself a finding about what `k_max` buys.
 | Deviation | Why |
 |---|---|
 | `delta_to_pose` → **cumsum** over the 6 EEF dims | Original (`train_asyncvla.py:281`) is **SE(2) body-frame** composition — each delta is rotated by the accumulated heading (`dx_w = cosθ·dx − sinθ·dy`), θ accumulates. LIBERO OSC deltas are **world-frame**, so they add: cumsum is the correct analog (exact for translation; small-angle approximation for axis-angle rotation). |
+| Smoothness-term target no longer means "no motion" | `mse_smooth` is algebraically identical to `mean(pred[..., :6]**2)` — an L2 shrinkage of the normalized EEF deltas toward 0. In the original, nav actions are **scale-only** normalized, so 0 == "no motion", and the term genuinely means smoothness. LIBERO actions use **offset (`BOUNDS_Q99`) normalization** (`_bounds_q99_normalize`), so normalized-0 is the **midpoint** of `[q01, q99]` (≈ +0.096/+0.107 in raw x/y), not "no motion" — the term biases predictions toward a small constant drift rather than toward stillness. Weight is only 0.1, so impact is small, but it is embodiment-forced (a consequence of the normalization scheme, not a choice) and must be recorded rather than hidden. |
 | Drop `obj_pose` loss term | LeLaN language-object grounding; no LIBERO analog. |
 | Drop horizontal-flip augmentation (keep random crop) | Their flip is valid *only because they mirror the actions* (`nomad_traj_norm[:,1] = -...`, heading `sin`). Mirroring 6-DoF EEF + gripper (negate y, flip rotations about x/z, asymmetric wrist view) is error-prone. |
 | Base model: OmniVLA 8.27B → OpenVLA-OFT 7B LIBERO | Different embodiment/task. |
@@ -153,12 +162,22 @@ to expose the cliff — itself a finding about what `k_max` buys.
 | 50k steps / batch 8 / 1×H200 (vs 750k / 5×H200 / grad-accum 2) | ≈77 h on one GPU; ~25× smaller dataset; edge saturates by ~10k steps. |
 | LR decay 10× at 100k steps (`train_asyncvla.py:211`) never triggers | We train 50k. Moot, not removed. |
 
+**Unforced (deliberate)**
+
+| Deviation | Why |
+|---|---|
+| `shead`/`action_proj` trained in **fp32** → original trains in **bf16** | Original (`train_asyncvla.py:1022,1031`) casts `shead`/`action_proj` to bf16. We build/train both in fp32 (`edge_arch.py:103-104`). Not embodiment-forced — a deliberate choice (numerical headroom for a from-scratch small head on ~25x less data), recorded here so it isn't mistaken for an oversight. |
+
 ## 8. Files (this worktree)
 
-- `prismatic/models/small_head.py` — **one line**: `Edge_adapter`'s `nn.Linear(64, 8 * 4)` →
-  `nn.Linear(64, NUM_ACTIONS_CHUNK * ACTION_DIM)`. Retire `Edge_adapter_manip`.
-- `experiments/robot/libero/edge_arch.py` — build the original **`Edge_adapter`**; defaults read the
-  faithful values from `config_nav/dataset_config.yaml` (1024/4/4/4).
+- `prismatic/models/small_head.py` — `Edge_adapter` gains an `action_dim: int = 4` constructor
+  kwarg (4 = the original nav width, so every original caller is unchanged);
+  `nn.Linear(64, 8 * 4)` → `nn.Linear(64, NUM_ACTIONS_CHUNK * action_dim)`. Retire
+  `Edge_adapter_manip`.
+- `experiments/robot/libero/edge_arch.py` — build the original **`Edge_adapter`**, passing
+  `action_dim=ACTION_DIM` (=7) explicitly for LIBERO; capacity (1024/4/4/4) read from
+  `config_nav/dataset_config.yaml`. `build_edge_and_proj`'s `arch` argument is required (no
+  default) so no caller can silently fall back to the unfaithful 512/2/2/4 capacity.
 - `prismatic/vla/datasets/libero_dataset.py` — random-crop augmentation (shared box, train-only);
   `k_max` default **3**.
 - `vla-scripts/train_asyncvla_libero.py` — the 3-term MSE loss (§4); `k_max` default 3; `--image_aug`.
@@ -168,8 +187,8 @@ to expose the cliff — itself a finding about what `k_max` buys.
 
 ## 9. Testing
 
-- **Unit:** `Edge_adapter` at `config_nav` values (1024/4/4/4) outputs `[B, 8, 7]`; the one-line
-  change is a no-op at `ACTION_DIM=4` (assert the nav shape is unchanged).
+- **Unit:** `Edge_adapter` at `config_nav` values (1024/4/4/4) with `action_dim=ACTION_DIM` outputs
+  `[B, 8, 7]`; the default (no `action_dim` passed) stays `8 * 4 == 32`-wide (assert BOTH widths).
 - **Unit:** delay sampler with `k_max=3` — `k ∈ {0..3}`, clamped at episode start.
 - **Unit:** random crop — **one box per sample** shared across base/wrist/both edge frames; the crop
   is **off** at eval.

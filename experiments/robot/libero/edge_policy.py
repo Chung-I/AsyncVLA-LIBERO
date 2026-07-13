@@ -20,7 +20,7 @@ Chain per query (`EdgePolicy.act`):
      reproduces exactly regardless of the action values tokenized into them.
   2. `extract_actions_hidden_states(vla, batch, proprio_projector, num_patches=513)` ->
      `[B, 56, 4096]` bf16 hidden states (the `vla_feature` source).
-  3. `proj.predict_action(hidden.float(), taskid=zeros)` -> `vla_feature` `[B, 8, 512]`.
+  3. `proj.predict_action(hidden.float(), taskid=zeros)` -> `vla_feature` `[B, 8, 1024]` (faithful width).
   4. `edge(obs_img_96, past_img_96, vla_feature)` -> `[B, 8, 7]` predicted action chunk, in
      the SAME standardized/normalized target space the base's own L1 action head predicts
      in (BOUNDS_Q99, gripper dim masked/pass-through) -- see the module docstring of
@@ -233,7 +233,7 @@ class EdgePolicy:
             )  # [1, 56, 4096] bf16
 
             taskid = torch.zeros(1, device=self.device)
-            self._cached_feature = self.proj.predict_action(hidden.to(torch.float32), taskid)  # [1, 8, 512] fp32
+            self._cached_feature = self.proj.predict_action(hidden.to(torch.float32), taskid)  # [1, 8, 1024] fp32 (faithful width)
             self._cached_base_frame96 = obs_img_96
             self._base_recompute_count += 1
 

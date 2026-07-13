@@ -27,7 +27,9 @@
 
 ## Task 1: Run the ORIGINAL `Edge_adapter`, at the original capacity
 
-Retire our `Edge_adapter_manip` duplicate and call the original class. The original needs exactly **one line**: `nn.Linear(64, 8 * 4)` → `nn.Linear(64, NUM_ACTIONS_CHUNK * ACTION_DIM)` — a **semantic no-op for navigation** (chunk 8 × ACTION_DIM 4 = 32, identical) that yields 8×7 under our LIBERO constants. The reshape at the end of `forward` already uses `(batch_size, NUM_ACTIONS_CHUNK, -1)` and adapts for free.
+Retire our `Edge_adapter_manip` duplicate and call the original class. The original head width becomes a constructor parameter: `nn.Linear(64, 8 * 4)` → `nn.Linear(64, NUM_ACTIONS_CHUNK * action_dim)`, with `action_dim: int = 4` (the original nav width) as the default, so every original caller — which never passes `action_dim` — stays byte-identical (`NUM_ACTIONS_CHUNK * 4 == 8 * 4 == 32`).
+
+**CORRECTION (post-implementation):** an earlier draft of this task described hardcoding `NUM_ACTIONS_CHUNK * ACTION_DIM` directly (no new parameter) as a "semantic no-op for navigation" on the premise that the nav constants are chunk=8 × `ACTION_DIM`=4. That premise is false: `prismatic/vla/constants.py` defines `ACTION_DIM = 7` (the LIBERO value) — there is no `ACTION_DIM=4` anywhere in this codebase. Hardcoding `ACTION_DIM` into the original class would have built a 56-wide head for the original nav callers too, breaking `train_asyncvla.py`'s loss (4-D `daction_ref` shape mismatch) and `run_asyncvla.py`'s checkpoint load (`[32,64]` vs `[56,64]`). The `action_dim` parameter (default 4) is the actual fix; the LIBERO path passes `action_dim=ACTION_DIM` (=7) explicitly via `build_edge_and_proj`. The reshape at the end of `forward` already uses `(batch_size, NUM_ACTIONS_CHUNK, -1)` and adapts for free either way.
 
 **Files:**
 - Modify: `prismatic/models/small_head.py` (line **51** inside `class Edge_adapter`; delete `class Edge_adapter_manip` at line **246**)
@@ -59,13 +61,18 @@ def test_original_edge_adapter_outputs_libero_chunk():
     assert out.shape == (B, NUM_ACTIONS_CHUNK, ACTION_DIM) == (B, 8, 7), out.shape
 
 
-def test_output_head_width_is_chunk_times_action_dim():
-    """The one-line change: Linear(64, 8*4) -> Linear(64, NUM_ACTIONS_CHUNK*ACTION_DIM).
-    Under the ORIGINAL nav constants (chunk=8, ACTION_DIM=4) this is 32 -- byte-identical to
-    the original `8 * 4`. Under LIBERO constants it is 56."""
-    edge = Edge_adapter(obs_encoding_size=1024, mha_num_attention_heads=4, mha_num_attention_layers=4)
-    assert edge.action_predictor[-1].out_features == NUM_ACTIONS_CHUNK * ACTION_DIM == 56
-    assert NUM_ACTIONS_CHUNK * 4 == 8 * 4  # the nav case is unchanged by construction
+def test_output_head_width_is_parameterized_not_hardcoded():
+    """action_dim is now a constructor kwarg: Linear(64, 8*4) -> Linear(64, NUM_ACTIONS_CHUNK*action_dim).
+    Default action_dim=4 (the ORIGINAL nav width) reproduces the original literal `8 * 4 == 32`
+    for every original caller. Passing action_dim=ACTION_DIM (=7, LIBERO) gives 56 -- NOT a
+    no-op; ACTION_DIM==7 everywhere in this codebase, there is no ACTION_DIM==4."""
+    edge_original_default = Edge_adapter(obs_encoding_size=1024, mha_num_attention_heads=4, mha_num_attention_layers=4)
+    assert edge_original_default.action_predictor[-1].out_features == 8 * 4 == 32
+
+    edge_libero = Edge_adapter(
+        obs_encoding_size=1024, mha_num_attention_heads=4, mha_num_attention_layers=4, action_dim=ACTION_DIM
+    )
+    assert edge_libero.action_predictor[-1].out_features == NUM_ACTIONS_CHUNK * ACTION_DIM == 56
 
 
 def test_edge_arch_from_config_nav_is_the_original_capacity():
@@ -90,25 +97,29 @@ def test_build_edge_and_proj_at_faithful_capacity():
 Run: `.venv/bin/python -m pytest tests/test_faithful_edge.py -v`
 Expected: FAIL — `Edge_adapter` still outputs `8*4=32` (shape `(B,8,4)`), and `EdgeArch.from_config_nav` does not exist.
 
-- [ ] **Step 3: Make the one-line change + point `edge_arch` at the original class**
+- [ ] **Step 3: Parameterize the head width + point `edge_arch` at the original class**
 
-In `prismatic/models/small_head.py`, inside `class Edge_adapter.__init__`'s `action_predictor` (line **51**):
+In `prismatic/models/small_head.py`, add `action_dim: int = 4` to `Edge_adapter.__init__`'s
+signature, and change the `action_predictor` output layer (line **51**):
 ```python
-            nn.Linear(64, NUM_ACTIONS_CHUNK * ACTION_DIM),
+            nn.Linear(64, NUM_ACTIONS_CHUNK * action_dim),
 ```
-(replacing `nn.Linear(64, 8 * 4),`). `NUM_ACTIONS_CHUNK` and `ACTION_DIM` are already imported at the top of the file. Change nothing else in the class.
+(replacing `nn.Linear(64, 8 * 4),`). `NUM_ACTIONS_CHUNK` is already imported at the top of the
+file; `ACTION_DIM` is NOT used here (it would be wrong for the original nav callers — see the
+correction above). Change nothing else in the class.
 
 Then **delete `class Edge_adapter_manip`** (starts line **246**) entirely — it was only ever `Edge_adapter` with that output parametrized.
 
 In `experiments/robot/libero/edge_arch.py`:
 - `from prismatic.models.small_head import Edge_adapter, Proj_Actiontokens` (drop `Edge_adapter_manip`).
-- In `build_edge_and_proj`, construct the edge with **all four** arch fields (the current code passes only `obs_encoding_size`, which silently left heads/layers at the class defaults — that was the original bug):
+- In `build_edge_and_proj`, construct the edge with **all four** arch fields (the current code passes only `obs_encoding_size`, which silently left heads/layers at the class defaults — that was the original bug) **plus `action_dim=ACTION_DIM`** (the LIBERO width, imported from `prismatic.vla.constants`) so the head is 56-wide, not the class default 32-wide:
 ```python
     edge = Edge_adapter(
         obs_encoding_size=arch.obs_encoding_size,
         mha_num_attention_heads=arch.mha_num_attention_heads,
         mha_num_attention_layers=arch.mha_num_attention_layers,
         mha_ff_dim_factor=arch.mha_ff_dim_factor,
+        action_dim=ACTION_DIM,
     )
 ```
 - Update the return type to `Tuple[Edge_adapter, Proj_Actiontokens]` and the docstrings that name `Edge_adapter_manip`.

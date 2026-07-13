@@ -114,14 +114,18 @@ def _print_speedup_table(t_base_ms: float, t_edge_ms: float) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
+    # Flag defaults are the FAITHFUL edge capacity (1024/4/4/4, `config_nav/dataset_config.yaml`),
+    # not `EdgeArch()`'s 512/2/2/4 historical/back-compat class defaults -- running this bench
+    # with no flags must report t_edge for the faithful curve, not a silently smaller edge.
+    _faithful = EdgeArch.from_config_nav()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--obs_encoding_size", type=int, default=EdgeArch().obs_encoding_size,
+    parser.add_argument("--obs_encoding_size", type=int, default=_faithful.obs_encoding_size,
                          help="Edge adapter token width (Edge_adapter.obs_encoding_size).")
-    parser.add_argument("--heads", type=int, default=EdgeArch().mha_num_attention_heads,
+    parser.add_argument("--heads", type=int, default=_faithful.mha_num_attention_heads,
                          help="Edge adapter MHA attention heads (Edge_adapter.mha_num_attention_heads).")
-    parser.add_argument("--layers", type=int, default=EdgeArch().mha_num_attention_layers,
+    parser.add_argument("--layers", type=int, default=_faithful.mha_num_attention_layers,
                          help="Edge adapter MHA attention layers (Edge_adapter.mha_num_attention_layers).")
-    parser.add_argument("--ff_dim_factor", type=int, default=EdgeArch().mha_ff_dim_factor,
+    parser.add_argument("--ff_dim_factor", type=int, default=_faithful.mha_ff_dim_factor,
                          help="Edge adapter MHA feed-forward dim factor (Edge_adapter.mha_ff_dim_factor).")
     return parser.parse_args()
 

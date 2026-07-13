@@ -1,15 +1,36 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from vla_scripts.train_asyncvla_libero import faithful_chunk_loss
 
 
 def test_loss_is_their_exact_weighted_sum():
-    """Weights are the original's: 0.5*15 (delta), 0.5 (traj), 0.1 (smoothness)."""
+    """Weights are the original's: 0.5*15 (delta), 0.5 (traj), 0.1 (smoothness).
+
+    The three terms are recomputed here INDEPENDENTLY from `pred`/`gt` (not read back out
+    of `faithful_chunk_loss`'s own `metrics` dict) -- so this test would catch
+    `faithful_chunk_loss` swapping which tensors feed which term while keeping the key
+    names the same (e.g. computing `mse_traj` on the raw actions instead of the cumsum).
+    """
     torch.manual_seed(0)
     pred, gt = torch.randn(2, 8, 7), torch.randn(2, 8, 7)
     loss, m = faithful_chunk_loss(pred, gt)
-    expected = 0.5 * 15.0 * m["mse_delta"] + 0.5 * m["mse_traj"] + 0.1 * m["mse_smooth"]
-    assert loss.item() == pytest.approx(expected, rel=1e-5)
+
+    # Independent recomputation, mirroring `train_asyncvla.py:552,557,559` (delta / traj /
+    # smoothness), NOT `faithful_chunk_loss`'s internals.
+    expected_delta = F.mse_loss(pred, gt)
+    pred_traj = torch.cumsum(pred[..., :6], dim=1)
+    gt_traj = torch.cumsum(gt[..., :6], dim=1)
+    expected_traj = F.mse_loss(pred_traj, gt_traj)
+    sm_ref = torch.cat([torch.zeros_like(pred_traj[:, :1]), pred_traj[:, :-1]], dim=1)
+    expected_smooth = F.mse_loss(pred_traj, sm_ref)
+
+    assert m["mse_delta"] == pytest.approx(expected_delta.item(), rel=1e-5)
+    assert m["mse_traj"] == pytest.approx(expected_traj.item(), rel=1e-5)
+    assert m["mse_smooth"] == pytest.approx(expected_smooth.item(), rel=1e-5)
+
+    expected_total = 0.5 * 15.0 * expected_delta + 0.5 * expected_traj + 0.1 * expected_smooth
+    assert loss.item() == pytest.approx(expected_total.item(), rel=1e-5)
 
 
 def test_gripper_excluded_from_traj_and_smoothness_terms():

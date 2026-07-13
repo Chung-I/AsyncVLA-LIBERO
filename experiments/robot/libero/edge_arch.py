@@ -34,6 +34,7 @@ from typing import Tuple, Union
 import torch
 
 from prismatic.models.small_head import Edge_adapter, Proj_Actiontokens
+from prismatic.vla.constants import ACTION_DIM
 
 EDGE_ARCH_FILENAME = "edge_arch.json"
 
@@ -41,7 +42,13 @@ EDGE_ARCH_FILENAME = "edge_arch.json"
 @dataclass
 class EdgeArch:
     """Edge adapter capacity. Defaults (512/2/2/4) match the historical hardcoded values
-    used by every Phase-1 checkpoint trained before this module existed."""
+    used by every Phase-1 checkpoint trained before this module existed.
+
+    DELIBERATELY LEFT AS-IS: these are the back-compat contract `load_edge_arch` relies on
+    for checkpoints with no `edge_arch.json` (see that function's docstring) -- do NOT
+    change them to the faithful 1024/4/4/4 capacity just because `build_edge_and_proj`'s
+    `arch` parameter below became required; that argument is unrelated to this class's own
+    field defaults."""
 
     obs_encoding_size: int = 512
     mha_num_attention_heads: int = 2
@@ -64,16 +71,26 @@ class EdgeArch:
 
 
 def build_edge_and_proj(
-    llm_dim: int, device: torch.device, arch: EdgeArch = EdgeArch()
+    llm_dim: int, device: torch.device, arch: EdgeArch
 ) -> Tuple[Edge_adapter, Proj_Actiontokens]:
     """Builds the trainable edge adapter + action-token projector (fp32), on `device`, at
     the given `arch`.
+
+    `arch` is REQUIRED (no default): the class-field defaults on `EdgeArch` (512/2/2/4) are
+    the historical Phase-1 *capacity*, kept only for `load_edge_arch`'s checkpoint back-compat
+    (see that function's docstring) -- they must never be a silent default for a fresh build.
+    Callers that want the faithful capacity must say so explicitly, e.g.
+    `EdgeArch.from_config_nav()`.
 
     INVARIANT: `Proj_Actiontokens(action_dim=...)` MUST equal
     `Edge_adapter(obs_encoding_size=...)` -- the projector's output tokens are
     concatenated with the edge's own image-encoding tokens (see `Edge_adapter.forward`),
     so their per-token feature width must match. Both are derived from `arch.obs_encoding_size`
     here to keep that invariant true by construction.
+
+    The edge's own output-head width (`NUM_ACTIONS_CHUNK * action_dim`) is set to the
+    LIBERO `ACTION_DIM` (7) explicitly -- `Edge_adapter`'s own `action_dim` default (4) is the
+    ORIGINAL navigation width and must stay untouched for every original caller.
     """
     proj = Proj_Actiontokens(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=arch.obs_encoding_size)
     edge = Edge_adapter(
@@ -81,6 +98,7 @@ def build_edge_and_proj(
         mha_num_attention_heads=arch.mha_num_attention_heads,
         mha_num_attention_layers=arch.mha_num_attention_layers,
         mha_ff_dim_factor=arch.mha_ff_dim_factor,
+        action_dim=ACTION_DIM,
     )
     proj = proj.to(device=device, dtype=torch.float32)
     edge = edge.to(device=device, dtype=torch.float32)

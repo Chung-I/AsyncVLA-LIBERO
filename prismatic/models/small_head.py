@@ -13,6 +13,7 @@ class Edge_adapter(nn.Module):
         mha_num_attention_heads: Optional[int] = 2,
         mha_num_attention_layers: Optional[int] = 2,
         mha_ff_dim_factor: Optional[int] = 4,
+        action_dim: int = 4,
     ) -> None:
         super(Edge_adapter, self).__init__()
         self.obs_encoding_size = obs_encoding_size
@@ -48,7 +49,7 @@ class Edge_adapter(nn.Module):
             nn.ReLU(),            
             nn.Linear(128, 64),  
             nn.ReLU(),            
-            nn.Linear(64, NUM_ACTIONS_CHUNK * ACTION_DIM),
+            nn.Linear(64, NUM_ACTIONS_CHUNK * action_dim),
         )
     def forward(self, obs_img: torch.tensor, past_img: torch.tensor, vla_feature: torch.tensor) -> torch.Tensor:
 

@@ -5,22 +5,33 @@ from experiments.robot.libero.edge_arch import EdgeArch, build_edge_and_proj
 
 
 def test_original_edge_adapter_outputs_libero_chunk():
-    """The ORIGINAL Edge_adapter, at the ORIGINAL capacity, emits an 8x7 LIBERO chunk."""
+    """The ORIGINAL Edge_adapter, at the ORIGINAL capacity, with `action_dim=ACTION_DIM`
+    passed explicitly (as `build_edge_and_proj` does for LIBERO), emits an 8x7 chunk."""
     B, D = 2, 1024
     edge = Edge_adapter(
-        obs_encoding_size=D, mha_num_attention_heads=4, mha_num_attention_layers=4, mha_ff_dim_factor=4
+        obs_encoding_size=D, mha_num_attention_heads=4, mha_num_attention_layers=4, mha_ff_dim_factor=4,
+        action_dim=ACTION_DIM,
     )
     out = edge(torch.randn(B, 3, 96, 96), torch.randn(B, 3, 96, 96), torch.randn(B, NUM_ACTIONS_CHUNK, D))
     assert out.shape == (B, NUM_ACTIONS_CHUNK, ACTION_DIM) == (B, 8, 7), out.shape
 
 
-def test_output_head_width_is_chunk_times_action_dim():
-    """The one-line change: Linear(64, 8*4) -> Linear(64, NUM_ACTIONS_CHUNK*ACTION_DIM).
-    Under the ORIGINAL nav constants (chunk=8, ACTION_DIM=4) this expression evaluates to
-    32 -- byte-identical to the original literal `8 * 4` -- so the change is a semantic
-    no-op for navigation. Under LIBERO constants (chunk=8, ACTION_DIM=7) it is 56."""
-    edge = Edge_adapter(obs_encoding_size=1024, mha_num_attention_heads=4, mha_num_attention_layers=4)
-    assert edge.action_predictor[-1].out_features == NUM_ACTIONS_CHUNK * ACTION_DIM == 56
+def test_output_head_width_is_parameterized_not_hardcoded():
+    """`Edge_adapter.action_predictor`'s output width is `NUM_ACTIONS_CHUNK * action_dim`,
+    where `action_dim` is now a constructor kwarg. NOTE: the original nav action is 4-D
+    (`ACTION_DIM=7` in `prismatic/vla/constants.py` is the LIBERO value only), so this is
+    NOT a no-op under `ACTION_DIM` -- the default `action_dim=4` (32-wide) preserves the
+    original literal `Linear(64, 8 * 4)` byte-for-byte for every original caller
+    (`vla-scripts/train_asyncvla.py`, `inference/run_asyncvla.py`, which never pass
+    `action_dim`); the LIBERO path passes `action_dim=ACTION_DIM` (=7, 56-wide) explicitly
+    via `build_edge_and_proj`."""
+    edge_original_default = Edge_adapter(obs_encoding_size=1024, mha_num_attention_heads=4, mha_num_attention_layers=4)
+    assert edge_original_default.action_predictor[-1].out_features == 8 * 4 == 32
+
+    edge_libero = Edge_adapter(
+        obs_encoding_size=1024, mha_num_attention_heads=4, mha_num_attention_layers=4, action_dim=ACTION_DIM
+    )
+    assert edge_libero.action_predictor[-1].out_features == NUM_ACTIONS_CHUNK * ACTION_DIM == 56
 
 
 def test_edge_arch_from_config_nav_is_the_original_capacity():

@@ -257,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_center_crop", action="store_true", help="Disable center-crop image preprocessing.")
     parser.add_argument("--no_save_video", action="store_true", help="Skip saving MP4 rollout videos.")
     parser.add_argument("--edge_ckpt", type=str, default=None,
-                        help="Path to the `Edge_adapter_manip` checkpoint (`shead--<step>_checkpoint.pt`). "
+                        help="Path to the `Edge_adapter` checkpoint (`shead--<step>_checkpoint.pt`). "
                              "Required for --mode edge.")
     parser.add_argument("--proj_ckpt", type=str, default=None,
                         help="Path to the `Proj_Actiontokens` checkpoint (`proj--<step>_checkpoint.pt`). "

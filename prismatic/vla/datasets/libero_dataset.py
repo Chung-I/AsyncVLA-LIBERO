@@ -264,8 +264,21 @@ def build_base_item(
 
 
 def _sample_delay(t: int, k_max: int, rng: "np.random.RandomState") -> int:
-    """Delay k for delay-aware training: Uniform{0..k_max}, clamped so t-k >= 0."""
-    return int(min(rng.randint(0, k_max + 1), t))
+    """Delay k for delay-aware training, matching the ORIGINAL
+    (`prismatic/vla/datasets/lelan_dataset.py:305`: `lt = random.randint(0, min(iv, 3))`).
+
+    The original RE-RANGES the upper bound to `min(t, k_max)` and THEN samples uniformly
+    over the resulting (smaller) inclusive range -- it does NOT sample over the full
+    `[0, k_max]` and clamp afterward. Those two are NOT the same distribution near episode
+    start: at t=1, k_max=3, re-ranging gives k in {0,1} each with P=1/2, while
+    sample-then-clamp gives P(k=0)=1/4, P(k=1)=3/4 (both nonzero draws {1,2,3} clamp to 1).
+
+    `random.randint(a, b)` (original, Python stdlib) is INCLUSIVE of `b`.
+    `rng.randint(a, b)` (here, numpy) is HALF-OPEN (excludes `b`) -- so the inclusive upper
+    bound `min(t, k_max)` requires `rng.randint(0, min(t, k_max) + 1)`.
+    """
+    hi = min(t, k_max)
+    return int(rng.randint(0, hi + 1))
 
 
 def _has_tfrecords(data_dir: Path) -> bool:
@@ -338,7 +351,7 @@ class LiberoSpatialDataset(Dataset):
         episode_limit: int = 2,
         predict_stop_token: bool = True,
         delay_aware: bool = False,
-        k_max: int = 15,
+        k_max: int = 3,
         rng_seed: int = 0,
         image_aug: bool = False,
     ) -> None:
@@ -420,6 +433,15 @@ class LiberoSpatialDataset(Dataset):
         # current, edge past) -- BEFORE `_to_base_image`/`_to_edge_frame` run, exactly as the
         # original applies one `PILbox` across its base/current/goal frames.
         if self.image_aug:
+            # The crop box is derived from `raw_now`'s H,W and then applied to all four raw
+            # frames (base agentview, base wrist, edge current, edge past) -- both LIBERO
+            # streams happen to be 256x256 today, but a differing wrist resolution would
+            # silently mis-crop (or, at extreme aspect ratios, produce an empty array that
+            # only explodes later inside `Image.fromarray`). Fail loudly here instead.
+            assert raw_now.shape[:2] == raw_base.shape[:2] == raw_wrist.shape[:2] == raw_prev.shape[:2], (
+                f"image_aug requires all raw frames to share H,W: obs={raw_now.shape[:2]}, "
+                f"base={raw_base.shape[:2]}, wrist={raw_wrist.shape[:2]}, past={raw_prev.shape[:2]}"
+            )
             v, hh = _sample_crop_offsets(raw_now.shape[0], raw_now.shape[1], self._aug_rng)
             self._last_crop_offsets = (v, hh)
             raw_now = _apply_crop(raw_now, v, hh)

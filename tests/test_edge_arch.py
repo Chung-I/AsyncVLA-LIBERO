@@ -1,7 +1,7 @@
 """CPU-only unit tests for `experiments.robot.libero.edge_arch`.
 
 No GPU and no 7B base model required: these tests only exercise the small trainable
-edge adapter (`Edge_adapter_manip`) + action-token projector (`Proj_Actiontokens`), built
+edge adapter (`Edge_adapter`) + action-token projector (`Proj_Actiontokens`), built
 directly on `device="cpu"`.
 """
 

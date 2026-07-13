@@ -12,6 +12,22 @@ def test_sample_delay_clamps_at_episode_start():
         assert 0 <= _sample_delay(3, 15, rng) <= 3
 
 
+def test_sample_delay_reranges_not_clamps_at_t1():
+    """Pins the ORIGINAL distribution at episode start (`lelan_dataset.py:305`:
+    `lt = random.randint(0, min(iv, 3))`), which RE-RANGES the upper bound to
+    `min(t, k_max)` and samples uniformly over that -- it does NOT sample over the full
+    `[0, k_max]` and clamp. At t=1, k_max=3: re-ranging gives k in {0,1} each with
+    P=1/2; sample-then-clamp (the bug) gives P(k=0)=1/4, P(k=1)=3/4 (draws {1,2,3} all
+    clamp to 1). This distinguishes the two by drawing many samples and checking the
+    empirical P(k=1) lands near 1/2, not 3/4.
+    """
+    rng = np.random.RandomState(0)
+    draws = [_sample_delay(1, 3, rng) for _ in range(20_000)]
+    assert set(draws) == {0, 1}  # only these two values are reachable at t=1, k_max=3
+    frac_one = sum(draws) / len(draws)
+    assert abs(frac_one - 0.5) < 0.02, frac_one  # re-ranged uniform: ~0.5, NOT ~0.75
+
+
 def test_delay_aware_item_has_same_keys_and_shapes():
     # Uses the small local RLDS shard fixture path (skips if absent).
     from prismatic.vla.datasets.libero_dataset import DEFAULT_DATA_DIR, _has_tfrecords
