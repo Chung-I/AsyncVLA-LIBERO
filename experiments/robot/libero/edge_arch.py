@@ -1,13 +1,16 @@
 r"""EdgeArch: single source of truth for the AsyncVLA-LIBERO edge adapter's capacity.
 
-The edge adapter (`Edge_adapter_manip`) and its companion action-token projector
-(`Proj_Actiontokens`) are currently trained at 512 width / 2 heads / 2 layers (the class
-defaults). The ORIGINAL AsyncVLA runs the edge at 1024 width / 4 heads / 4 layers
-(`config_nav/dataset_config.yaml`). Heads/layers are NOT recoverable from a `state_dict`'s
-tensor shapes alone (attention block shapes depend on `embed_dim`, but the *number* of
-layers/heads is architecture, not a tensor shape you can infer post hoc) -- so an eval that
-rebuilds the edge with the wrong `mha_num_attention_heads`/`mha_num_attention_layers` will
-either fail to load or silently load garbage into mismatched positions.
+The edge adapter is the ORIGINAL `Edge_adapter` class (`prismatic.models.small_head`),
+unmodified except for a single semantic-no-op line that lets its output head adapt to
+whatever `(NUM_ACTIONS_CHUNK, ACTION_DIM)` the caller is running under, plus its companion
+action-token projector (`Proj_Actiontokens`). Historical AsyncVLA-LIBERO runs trained it at
+512 width / 2 heads / 2 layers (the class defaults). The ORIGINAL AsyncVLA runs the edge at
+1024 width / 4 heads / 4 layers (`config_nav/dataset_config.yaml`, readable via
+`EdgeArch.from_config_nav()`). Heads/layers are NOT recoverable from a `state_dict`'s tensor
+shapes alone (attention block shapes depend on `embed_dim`, but the *number* of layers/heads
+is architecture, not a tensor shape you can infer post hoc) -- so an eval that rebuilds the
+edge with the wrong `mha_num_attention_heads`/`mha_num_attention_layers` will either fail to
+load or silently load garbage into mismatched positions.
 
 This module is the ONE place both `vla-scripts/train_asyncvla_libero.py` (which trains and
 saves `edge_arch.json` next to each checkpoint) and `experiments/robot/libero/edge_policy.py`
@@ -30,7 +33,7 @@ from typing import Tuple, Union
 
 import torch
 
-from prismatic.models.small_head import Edge_adapter_manip, Proj_Actiontokens
+from prismatic.models.small_head import Edge_adapter, Proj_Actiontokens
 
 EDGE_ARCH_FILENAME = "edge_arch.json"
 
@@ -45,21 +48,35 @@ class EdgeArch:
     mha_num_attention_layers: int = 2
     mha_ff_dim_factor: int = 4
 
+    @classmethod
+    def from_config_nav(cls, path: str = "config_nav/dataset_config.yaml") -> "EdgeArch":
+        """The ORIGINAL AsyncVLA edge capacity, read from the same file `train_asyncvla.py`
+        reads (`config_nav/dataset_config.yaml`): 1024 / 4 heads / 4 layers / ff x4."""
+        import yaml
+        from pathlib import Path
+        cfg = yaml.safe_load(Path(__file__).resolve().parents[3].joinpath(path).read_text())
+        return cls(
+            obs_encoding_size=int(cfg["obs_encoding_size"]),
+            mha_num_attention_heads=int(cfg["mha_num_attention_heads"]),
+            mha_num_attention_layers=int(cfg["mha_num_attention_layers"]),
+            mha_ff_dim_factor=int(cfg["mha_ff_dim_factor"]),
+        )
+
 
 def build_edge_and_proj(
     llm_dim: int, device: torch.device, arch: EdgeArch = EdgeArch()
-) -> Tuple[Edge_adapter_manip, Proj_Actiontokens]:
+) -> Tuple[Edge_adapter, Proj_Actiontokens]:
     """Builds the trainable edge adapter + action-token projector (fp32), on `device`, at
     the given `arch`.
 
     INVARIANT: `Proj_Actiontokens(action_dim=...)` MUST equal
-    `Edge_adapter_manip(obs_encoding_size=...)` -- the projector's output tokens are
-    concatenated with the edge's own image-encoding tokens (see `Edge_adapter_manip.forward`),
+    `Edge_adapter(obs_encoding_size=...)` -- the projector's output tokens are
+    concatenated with the edge's own image-encoding tokens (see `Edge_adapter.forward`),
     so their per-token feature width must match. Both are derived from `arch.obs_encoding_size`
     here to keep that invariant true by construction.
     """
     proj = Proj_Actiontokens(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=arch.obs_encoding_size)
-    edge = Edge_adapter_manip(
+    edge = Edge_adapter(
         obs_encoding_size=arch.obs_encoding_size,
         mha_num_attention_heads=arch.mha_num_attention_heads,
         mha_num_attention_layers=arch.mha_num_attention_layers,

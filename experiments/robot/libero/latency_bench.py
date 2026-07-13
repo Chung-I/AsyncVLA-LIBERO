@@ -6,7 +6,7 @@ Measures, on the real frozen OpenVLA-OFT LIBERO base + the small edge adapter:
     (`extract_actions_hidden_states`) + hidden-state projection
     (`Proj_Actiontokens.predict_action`) -- the expensive "server-side" step that
     only needs to run every N control steps in the async scheme.
-  - ``t_edge_ms``: mean wall-clock of ONE `Edge_adapter_manip` forward -- the cheap
+  - ``t_edge_ms``: mean wall-clock of ONE `Edge_adapter` forward -- the cheap
     "client-side" step that runs every control step.
 
 Both timings synchronize the GPU immediately before and after each timed region
@@ -116,13 +116,13 @@ def _print_speedup_table(t_base_ms: float, t_edge_ms: float) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--obs_encoding_size", type=int, default=EdgeArch().obs_encoding_size,
-                         help="Edge adapter token width (Edge_adapter_manip.obs_encoding_size).")
+                         help="Edge adapter token width (Edge_adapter.obs_encoding_size).")
     parser.add_argument("--heads", type=int, default=EdgeArch().mha_num_attention_heads,
-                         help="Edge adapter MHA attention heads (Edge_adapter_manip.mha_num_attention_heads).")
+                         help="Edge adapter MHA attention heads (Edge_adapter.mha_num_attention_heads).")
     parser.add_argument("--layers", type=int, default=EdgeArch().mha_num_attention_layers,
-                         help="Edge adapter MHA attention layers (Edge_adapter_manip.mha_num_attention_layers).")
+                         help="Edge adapter MHA attention layers (Edge_adapter.mha_num_attention_layers).")
     parser.add_argument("--ff_dim_factor", type=int, default=EdgeArch().mha_ff_dim_factor,
-                         help="Edge adapter MHA feed-forward dim factor (Edge_adapter_manip.mha_ff_dim_factor).")
+                         help="Edge adapter MHA feed-forward dim factor (Edge_adapter.mha_ff_dim_factor).")
     return parser.parse_args()
 
 
