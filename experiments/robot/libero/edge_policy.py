@@ -56,7 +56,7 @@ from PIL import Image
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
 from experiments.robot.libero.base_features import extract_actions_hidden_states
-from experiments.robot.libero.edge_arch import build_edge_and_proj, load_edge_arch, validate_edge_arch
+from experiments.robot.libero.edge_arch import EdgeArch, build_edge_and_proj, load_edge_arch, validate_edge_arch
 from experiments.robot.libero.libero_utils import get_libero_image, get_libero_wrist_image, quat2axisangle
 from experiments.robot.openvla_utils import DEVICE, normalize_proprio, prepare_images_for_vla
 from prismatic.vla.action_tokenizer import ActionTokenizer
@@ -132,6 +132,7 @@ class EdgePolicy:
         edge_ckpt: str,
         proj_ckpt: str,
         device: Optional[torch.device] = None,
+        edge_arch: Optional[EdgeArch] = None,
     ) -> None:
         self.cfg = cfg
         self.device = device if device is not None else DEVICE
@@ -143,11 +144,15 @@ class EdgePolicy:
         self.cfg.unnorm_key = self.unnorm_key
 
         # Auto-detect the edge architecture the checkpoint was trained with, via
-        # `edge_arch.json` saved next to it -- RAISES if that file is missing (see
+        # `edge_arch.json` saved next to it -- RAISES if that file is missing AND no
+        # explicit `edge_arch` was passed (see
         # `experiments.robot.libero.edge_arch.load_edge_arch`). Heads/layers are NOT
         # recoverable from `state_dict` tensor shapes alone, so building the wrong
         # architecture here would silently load garbage instead of failing `load_state_dict`.
-        self.edge_arch = load_edge_arch(edge_ckpt)
+        # `edge_arch` is the escape hatch for checkpoints that predate `edge_arch.json`
+        # (e.g. historical Phase-1 checkpoints): pass it explicitly and the json is never
+        # consulted.
+        self.edge_arch = load_edge_arch(edge_ckpt, arch=edge_arch)
         print(f"[EdgePolicy] resolved edge arch: {self.edge_arch}")
 
         self.edge, self.proj = build_edge_and_proj(self.vla.llm_dim, self.device, self.edge_arch)

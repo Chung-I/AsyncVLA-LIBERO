@@ -1,5 +1,14 @@
 # AsyncVLA-LIBERO **Faithful** Phase-2 — Implementation Plan
 
+> **NOTE (2026-07-13, post-implementation):** This plan describes the original 3-term loss
+> (`0.5`/`0.5×15`/`0.1`, including a "smoothness" term) as the target to reproduce. That
+> smoothness term was later DROPPED (it turned out to be a mislabeled magnitude-only penalty,
+> not "don't jerk" — see the design spec's §7 deviation ledger,
+> `docs/superpowers/specs/2026-07-13-asyncvla-libero-faithful-design.md`, and
+> `faithful_chunk_loss` in `vla-scripts/train_asyncvla_libero.py`). This plan is left
+> UNCHANGED below as the historical record of what was originally planned; it does not
+> reflect the final 2-term loss that was actually shipped.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reproduce AsyncVLA's Phase 2 as faithfully as the embodiment allows — original `Edge_adapter` at the original capacity, `k_max=3`, their exact 3-term weighted MSE loss, and their random-crop augmentation — then produce the faithful SR-vs-cadence curve (N∈{1,2,3,4,6,8}) against the validated 0.982 stock topline.

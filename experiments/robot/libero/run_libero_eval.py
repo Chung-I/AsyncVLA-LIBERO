@@ -60,6 +60,7 @@ from experiments.robot.libero import _robosuite_logpatch  # noqa: F401  (import 
 from libero.libero import benchmark
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
+from experiments.robot.libero.edge_arch import EdgeArch
 from experiments.robot.libero.edge_policy import EdgeEvalConfig, EdgePolicy, resolve_unnorm_key
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
@@ -262,6 +263,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proj_ckpt", type=str, default=None,
                         help="Path to the `Proj_Actiontokens` checkpoint (`proj--<step>_checkpoint.pt`). "
                              "Required for --mode edge.")
+    parser.add_argument("--edge_arch_obs_encoding_size", type=int, default=None,
+                        help="(--mode edge/async only) Explicit `EdgeArch.obs_encoding_size` override, for "
+                             "checkpoints saved before `edge_arch.json` existed (no auto-detected arch "
+                             "next to the checkpoint). Must be given together with the other three "
+                             "--edge_arch_* flags, or not at all.")
+    parser.add_argument("--edge_arch_mha_num_attention_heads", type=int, default=None,
+                        help="(--mode edge/async only) Explicit `EdgeArch.mha_num_attention_heads` override. "
+                             "See --edge_arch_obs_encoding_size.")
+    parser.add_argument("--edge_arch_mha_num_attention_layers", type=int, default=None,
+                        help="(--mode edge/async only) Explicit `EdgeArch.mha_num_attention_layers` override. "
+                             "See --edge_arch_obs_encoding_size.")
+    parser.add_argument("--edge_arch_mha_ff_dim_factor", type=int, default=None,
+                        help="(--mode edge/async only) Explicit `EdgeArch.mha_ff_dim_factor` override. "
+                             "See --edge_arch_obs_encoding_size.")
     parser.add_argument("--use_wandb", type=lambda x: str(x).lower() not in ("false", "0", "no"),
                          default=True, help="Log results to Weights & Biases (default: True).")
     parser.add_argument("--wandb_project", type=str, default="asyncvla-libero",
@@ -274,6 +289,29 @@ def main():
     assert args.mode in ("stock", "edge", "async"), f"Unknown --mode {args.mode!r}."
     if args.mode in ("edge", "async"):
         assert args.edge_ckpt and args.proj_ckpt, f"--edge_ckpt and --proj_ckpt are required for --mode {args.mode}."
+
+    edge_arch_fields = (
+        args.edge_arch_obs_encoding_size,
+        args.edge_arch_mha_num_attention_heads,
+        args.edge_arch_mha_num_attention_layers,
+        args.edge_arch_mha_ff_dim_factor,
+    )
+    num_edge_arch_fields_given = sum(f is not None for f in edge_arch_fields)
+    assert num_edge_arch_fields_given in (0, 4), (
+        "--edge_arch_* flags must be given all four together (or not at all): got "
+        f"{num_edge_arch_fields_given}/4. This is the escape hatch for checkpoints saved "
+        "before `edge_arch.json` existed -- see `edge_arch.load_edge_arch`."
+    )
+    edge_arch = (
+        EdgeArch(
+            obs_encoding_size=args.edge_arch_obs_encoding_size,
+            mha_num_attention_heads=args.edge_arch_mha_num_attention_heads,
+            mha_num_attention_layers=args.edge_arch_mha_num_attention_layers,
+            mha_ff_dim_factor=args.edge_arch_mha_ff_dim_factor,
+        )
+        if num_edge_arch_fields_given == 4
+        else None
+    )
 
     set_seed_everywhere(args.seed)
 
@@ -344,6 +382,7 @@ def main():
         )
         edge_policy = EdgePolicy(
             edge_cfg, task_suite_name=args.task_suite_name, edge_ckpt=args.edge_ckpt, proj_ckpt=args.proj_ckpt,
+            edge_arch=edge_arch,
         )
         logger.info(f"Resolved unnorm_key={edge_policy.unnorm_key!r}, base_cadence={edge_policy.base_cadence}")
 

@@ -151,7 +151,7 @@ to expose the cliff — itself a finding about what `k_max` buys.
 |---|---|
 | `delta_to_pose` → **cumsum** over the 6 EEF dims | Original (`train_asyncvla.py:281`) is **SE(2) body-frame** composition — each delta is rotated by the accumulated heading (`dx_w = cosθ·dx − sinθ·dy`), θ accumulates. LIBERO OSC deltas are **world-frame**, so they add: cumsum is the correct analog (exact for translation; small-angle approximation for axis-angle rotation). |
 | **Trajectory-term rotation approximation** | `cumsum` treats the 3 rotation dims (axis-angle) of the LIBERO action as a vector space, i.e. integrates them by addition. 3-D rotations don't commute in general, so this is a first-order (small-angle) approximation, not exact composition (unlike the 2-D `cosθ/sinθ` heading case above, which is exact for the translation part and only approximate for the heading itself). It holds well in practice: LIBERO's per-step rotation deltas are small — `bounds_q99` span ≈0.21–0.38 rad for the 3 rotation dims vs ≈1.5–1.9 for the 3 translation dims — so consecutive small rotations approximately commute over an 8-step chunk. |
-| **Smoothness term DROPPED — reproduces a bug, not a fidelity gap** (supersedes the earlier "Smoothness-term target no longer means 'no motion'" framing, which treated this as merely embodiment-forced; we now drop the term outright rather than adapt it) | Their term is `0.1 * MSE(sm_ref, predicted_actions)`, where `predicted_actions = delta_to_pose(deltas)` is SE(2) composition and `sm_ref` is the previous predicted pose. Writing the pose as `p_t = (x, y, cosθ, sinθ)`, the consecutive-pose difference has xy-part `R(θ_{t−1})·d_t` and heading-part with squared norm `2 − 2cos(Δθ_t)`. Because a rotation preserves norm, `‖R·d‖² = ‖d‖²`, so the whole term collapses in closed form to `nav_smooth = mean_t[dx_t² + dy_t² + 4·sin²(Δθ_t/2)]` — a pure function of the predicted DELTAS' MAGNITUDES, with no ground truth and no curvature term. It is "take small steps," NOT "don't jerk" — a mislabeled magnitude penalty. (Verified numerically against their verbatim `delta_to_pose`: 0.53007358 vs 0.53007358, exact.) Under our LIBERO `bounds_q99` OFFSET normalization it is worse than useless: normalized-zero is the MIDPOINT of `[q01, q99]`, not zero motion, so the term pulls the policy toward a constant raw drift (≈ +0.096/+0.107 in x/y) rather than toward stillness or smoothness. We drop it rather than reproduce a proven bug. |
+| **Smoothness term DROPPED — reproduces a bug, not a fidelity gap** (supersedes the earlier "Smoothness-term target no longer means 'no motion'" framing, which treated this as merely embodiment-forced; we now drop the term outright rather than adapt it) | Their term is `0.1 * MSE(sm_ref, predicted_actions)`, where `predicted_actions = delta_to_pose(deltas)` is SE(2) composition and `sm_ref` is the previous predicted pose. Writing the pose as `p_t = (x, y, cosθ, sinθ)`, the consecutive-pose difference has xy-part `R(θ_{t−1})·d_t` and heading-part with squared norm `2 − 2cos(Δθ_t)`. Because a rotation preserves norm, `‖R·d‖² = ‖d‖²`, so the whole term collapses in closed form to `nav_smooth = ¼ · mean_t[dx_t² + dy_t² + 4·sin²(Δθ_t/2)]` (the ¼ comes from `nn.MSELoss` averaging over all 4 pose channels x, y, cosθ, sinθ) — a pure function of the predicted DELTAS' MAGNITUDES, with no ground truth and no curvature term. It is "take small steps," NOT "don't jerk" — a mislabeled magnitude penalty. (Verified numerically against their verbatim `delta_to_pose`, exact match to the ¼ form: 0.53007358 vs 0.53007358.) Under our LIBERO `bounds_q99` OFFSET normalization it is worse than useless: normalized-zero is the MIDPOINT of `[q01, q99]`, not zero motion, so the term pulls the policy toward a constant raw drift (≈ +0.096/+0.107 in x/y) rather than toward stillness or smoothness. We drop it rather than reproduce a proven bug. |
 | **Loss weight ROLES are reversed** | In the original, WAYPOINTS are the primary supervised data (`nomad_traj_norm`, "normalized pose on robot coordinate") and the deltas are DERIVED via `pose_to_delta`; in LIBERO the DELTAS are primary (the OSC commands in the RLDS `action` field) and the trajectory is derived via `cumsum`. We kept their numeric weights (15× on delta, 0.5 on trajectory), but those weights now sit on the opposite quantities — numerically identical weights, semantically different objective. |
 | Drop `obj_pose` loss term | LeLaN language-object grounding; no LIBERO analog. |
 | Drop horizontal-flip augmentation (keep random crop) | Their flip is valid *only because they mirror the actions* (`nomad_traj_norm[:,1] = -...`, heading `sin`). Mirroring 6-DoF EEF + gripper (negate y, flip rotations about x/z, asymmetric wrist view) is error-prone. |
@@ -192,8 +192,23 @@ to expose the cliff — itself a finding about what `k_max` buys.
 - `prismatic/vla/datasets/libero_dataset.py` — random-crop augmentation (shared box, train-only);
   `k_max` default **3**.
 - `vla-scripts/train_asyncvla_libero.py` — the 2-term MSE loss (§4, §7); `k_max` default 3; `--image_aug`; `MultiStepLR` decay (§7).
-- `experiments/robot/libero/run_libero_eval.py`, `edge_policy.py`, `latency_bench.py` — **unchanged**
-  (already faithful; `latency_bench` picks up the new capacity via `EdgeArch`).
+- `experiments/robot/libero/latency_bench.py` — **unchanged** (already faithful; picks up the
+  new capacity via `EdgeArch`).
+- `experiments/robot/libero/edge_policy.py` — `EdgePolicy.__init__` now resolves its edge
+  architecture via `edge_arch.load_edge_arch` (raises if `edge_arch.json` is missing and no
+  explicit `EdgeArch` is passed) and cross-checks the loaded checkpoint against it via
+  `edge_arch.validate_edge_arch` before `load_state_dict`. It also accepts an optional
+  `edge_arch: Optional[EdgeArch] = None` constructor arg — the escape hatch for checkpoints
+  saved before `edge_arch.json` existed (e.g. historical Phase-1 checkpoints), passed through
+  to `load_edge_arch(edge_ckpt, arch=edge_arch)`.
+- `experiments/robot/libero/run_libero_eval.py` — exposes that escape hatch as four CLI flags
+  (`--edge_arch_obs_encoding_size`, `--edge_arch_mha_num_attention_heads`,
+  `--edge_arch_mha_num_attention_layers`, `--edge_arch_mha_ff_dim_factor`; must be given all
+  four together or not at all) so a checkpoint predating `edge_arch.json` can still be
+  evaluated under `--mode edge`/`--mode async` without a code change. **Every LIBERO
+  checkpoint saved by `train_asyncvla_libero.py` (this branch) already writes
+  `edge_arch.json` next to it (§7/§9), so this flag is only needed for a checkpoint that
+  predates this branch — the default (no flags) still raises loudly rather than guessing.**
 - `docs/superpowers/notes/faithful-results.md` — the deliverable write-up.
 
 ## 9. Testing

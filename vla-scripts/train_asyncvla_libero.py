@@ -89,11 +89,13 @@ def faithful_chunk_loss(pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Ten
     norm `2 − 2cos(Δθ_t)`. Because a rotation preserves norm, `‖R·d‖² = ‖d‖²`, so the whole
     term collapses in closed form to:
 
-        nav_smooth = mean_t [ dx_t² + dy_t² + 4·sin²(Δθ_t/2) ]
+        nav_smooth = ¼ · mean_t [ dx_t² + dy_t² + 4·sin²(Δθ_t/2) ]
 
-    i.e. a pure function of the predicted DELTAS' MAGNITUDES -- no ground truth, no
-    curvature. It is "take small steps," NOT "don't jerk." (Verified numerically against
-    the original's verbatim `delta_to_pose`: 0.53007358 vs 0.53007358, exact.) Under our
+    (the ¼ comes from `nn.MSELoss` averaging over all 4 pose channels x, y, cosθ, sinθ, not
+    just the 2 that carry the penalty's "content"). i.e. a pure function of the predicted
+    DELTAS' MAGNITUDES -- no ground truth, no curvature. It is "take small steps," NOT "don't
+    jerk." (Verified numerically against the original's verbatim `delta_to_pose`, exact match
+    to the ¼ form: 0.53007358 vs 0.53007358.) Under our
     LIBERO `bounds_q99` OFFSET normalization it is worse than useless: normalized-zero is
     the MIDPOINT of [q01,q99], not zero motion, so the term pulls the policy toward a
     constant raw drift (≈ +0.096/+0.107 in x/y). We therefore drop it rather than reproduce
