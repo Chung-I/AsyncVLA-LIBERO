@@ -56,16 +56,12 @@ from PIL import Image
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
 from experiments.robot.libero.base_features import extract_actions_hidden_states
+from experiments.robot.libero.edge_arch import build_edge_and_proj, load_edge_arch
 from experiments.robot.libero.libero_utils import get_libero_image, get_libero_wrist_image, quat2axisangle
 from experiments.robot.openvla_utils import DEVICE, normalize_proprio, prepare_images_for_vla
-from prismatic.models.small_head import Edge_adapter_manip, Proj_Actiontokens
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK
 from prismatic.vla.datasets.libero_dataset import NUM_BASE_PATCHES, _to_edge_frame, build_base_item
-
-# Must match `vla-scripts/train_asyncvla_libero.py::EDGE_OBS_ENCODING_SIZE` -- the
-# edge/proj checkpoints being loaded here were trained with this dim.
-EDGE_OBS_ENCODING_SIZE = 512
 
 
 @dataclass
@@ -146,16 +142,23 @@ class EdgePolicy:
         self.unnorm_key = resolve_unnorm_key(self.vla, task_suite_name)
         self.cfg.unnorm_key = self.unnorm_key
 
-        self.proj = Proj_Actiontokens(
-            input_dim=self.vla.llm_dim, hidden_dim=self.vla.llm_dim, action_dim=EDGE_OBS_ENCODING_SIZE
-        )
+        # Auto-detect the edge architecture the checkpoint was trained with, via
+        # `edge_arch.json` saved next to it (falls back to 512/2/2/4 for Phase-1
+        # checkpoints predating `edge_arch.json` -- see `experiments.robot.libero.edge_arch`).
+        # Heads/layers are NOT recoverable from `state_dict` tensor shapes alone, so building
+        # the wrong architecture here would silently fail `load_state_dict` (or, if shapes
+        # happened to align, silently load garbage).
+        self.edge_arch = load_edge_arch(edge_ckpt)
+        print(f"[EdgePolicy] resolved edge arch: {self.edge_arch}")
+
+        self.edge, self.proj = build_edge_and_proj(self.vla.llm_dim, self.device, self.edge_arch)
+
         proj_state = _strip_ddp_prefix(torch.load(proj_ckpt, map_location="cpu"))
         self.proj.load_state_dict(proj_state)
         self.proj.requires_grad_(False)
         self.proj.eval()
         self.proj.to(device=self.device, dtype=torch.float32)
 
-        self.edge = Edge_adapter_manip(obs_encoding_size=EDGE_OBS_ENCODING_SIZE)
         edge_state = _strip_ddp_prefix(torch.load(edge_ckpt, map_location="cpu"))
         self.edge.load_state_dict(edge_state)
         self.edge.requires_grad_(False)

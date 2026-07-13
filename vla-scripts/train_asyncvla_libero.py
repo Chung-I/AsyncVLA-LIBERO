@@ -51,7 +51,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
 from experiments.robot.libero.base_features import extract_actions_hidden_states
-from prismatic.models.small_head import Edge_adapter_manip, Proj_Actiontokens
+# `build_edge_and_proj` is re-exported here (not just imported) so existing callers that do
+# `from vla_scripts.train_asyncvla_libero import build_edge_and_proj`
+# (`train_one_batch_smoke`, `tests/test_train_overfit*.py`, `latency_bench.py`-style usage)
+# keep working unchanged; `edge_arch.py` is the single source of truth for its body.
+from experiments.robot.libero.edge_arch import EdgeArch, build_edge_and_proj, save_edge_arch
 from prismatic.vla.datasets.libero_dataset import (
     NUM_BASE_PATCHES,
     LiberoSpatialDataset,
@@ -61,8 +65,6 @@ from prismatic.vla.datasets.libero_dataset import (
 # ==============================
 # Config
 # ==============================
-
-EDGE_OBS_ENCODING_SIZE = 512  # Proj_Actiontokens action_dim == Edge_adapter_manip obs_encoding_size
 
 
 @dataclass
@@ -88,6 +90,15 @@ class AsyncVLALiberoConfig:
 
     run_root_dir: Path = Path("runs_libero")  # Path to directory to store checkpoints
     run_id_note: Optional[str] = None
+
+    # Edge adapter architecture (see `experiments.robot.libero.edge_arch.EdgeArch`). Defaults
+    # (512/2/2/4) match the historical hardcoded Phase-1 capacity; the ORIGINAL AsyncVLA runs
+    # the edge at 1024/4/4/4. `edge_arch.json` is saved alongside every checkpoint so eval can
+    # auto-detect which capacity a given checkpoint was trained at.
+    edge_obs_encoding_size: int = 512
+    edge_mha_heads: int = 2
+    edge_mha_layers: int = 2
+    edge_mha_ff_dim_factor: int = 4
 
     # Logging
     wandb_entity: Optional[str] = None
@@ -121,22 +132,16 @@ def unwrap(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DDP) else module
 
 
-def save_training_checkpoint(run_dir: Path, step: int, edge: nn.Module, proj: nn.Module) -> None:
+def save_training_checkpoint(run_dir: Path, step: int, edge: nn.Module, proj: nn.Module, arch: EdgeArch) -> None:
     """Saves `shead--<step>_checkpoint.pt` (edge adapter) and `proj--<step>_checkpoint.pt`
-    (action-token projector). Base model / proprio projector are frozen and never saved."""
+    (action-token projector). Base model / proprio projector are frozen and never saved.
+    Also (re)writes `edge_arch.json` into `run_dir` so eval can auto-detect the architecture
+    these checkpoints were trained with (see `experiments.robot.libero.edge_arch`)."""
     os.makedirs(run_dir, exist_ok=True)
     torch.save(unwrap(edge).state_dict(), run_dir / f"shead--{step}_checkpoint.pt")
     torch.save(unwrap(proj).state_dict(), run_dir / f"proj--{step}_checkpoint.pt")
+    save_edge_arch(run_dir, arch)
     print(f"Saved checkpoint at step {step} to {run_dir}")
-
-
-def build_edge_and_proj(llm_dim: int, device: torch.device) -> Tuple[Edge_adapter_manip, Proj_Actiontokens]:
-    """Builds the trainable edge adapter + action-token projector (fp32), on `device`."""
-    proj = Proj_Actiontokens(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=EDGE_OBS_ENCODING_SIZE)
-    edge = Edge_adapter_manip(obs_encoding_size=EDGE_OBS_ENCODING_SIZE)
-    proj = proj.to(device=device, dtype=torch.float32)
-    edge = edge.to(device=device, dtype=torch.float32)
-    return edge, proj
 
 
 def run_forward_pass(
@@ -205,7 +210,13 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
     print("vla class", type(vla), "llm_dim", vla.llm_dim)
 
     # Build trainable edge adapter + projector.
-    edge, proj = build_edge_and_proj(vla.llm_dim, device)
+    edge_arch = EdgeArch(
+        obs_encoding_size=cfg.edge_obs_encoding_size,
+        mha_num_attention_heads=cfg.edge_mha_heads,
+        mha_num_attention_layers=cfg.edge_mha_layers,
+        mha_ff_dim_factor=cfg.edge_mha_ff_dim_factor,
+    )
+    edge, proj = build_edge_and_proj(vla.llm_dim, device, edge_arch)
     count_parameters(edge, "edge (shead)")
     count_parameters(proj, "proj")
 
@@ -271,7 +282,7 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
                     if world_size > 1:
                         dist.barrier()
                     if distributed_state.is_main_process:
-                        save_training_checkpoint(run_dir, step, edge, proj)
+                        save_training_checkpoint(run_dir, step, edge, proj, edge_arch)
                     if world_size > 1:
                         dist.barrier()
 
@@ -280,7 +291,7 @@ def train_asyncvla_libero(cfg: AsyncVLALiberoConfig) -> None:
                 break
 
     if distributed_state.is_main_process:
-        save_training_checkpoint(run_dir, step, edge, proj)
+        save_training_checkpoint(run_dir, step, edge, proj, edge_arch)
 
 
 # ==============================

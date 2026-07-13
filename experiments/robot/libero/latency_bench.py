@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import time
 from typing import Dict, Optional
 
@@ -32,13 +33,16 @@ import torch
 
 from experiments.robot.libero.base_config import LiberoBaseConfig, build_frozen_base
 from experiments.robot.libero.base_features import extract_actions_hidden_states
-from prismatic.models.small_head import Edge_adapter_manip, Proj_Actiontokens
+from experiments.robot.libero.edge_arch import EdgeArch, build_edge_and_proj
 from prismatic.vla.datasets.libero_dataset import make_dummy_base_batch
 
-EDGE_OBS_ENCODING_SIZE = 512
 
-
-def benchmark(n_warmup: int = 5, n_iter: int = 50, device: Optional[torch.device] = None) -> Dict[str, float]:
+def benchmark(
+    n_warmup: int = 5,
+    n_iter: int = 50,
+    device: Optional[torch.device] = None,
+    edge_arch: EdgeArch = EdgeArch(),
+) -> Dict[str, float]:
     """Measure mean per-call latency of the base (forward + projection) and the edge.
 
     Args:
@@ -47,6 +51,8 @@ def benchmark(n_warmup: int = 5, n_iter: int = 50, device: Optional[torch.device
         n_iter: number of timed iterations to average over.
         device: device to run on; defaults to the frozen base's device (i.e. wherever
             `build_frozen_base` placed it -- typically `cuda:0`).
+        edge_arch: edge adapter capacity to bench (see `experiments.robot.libero.edge_arch.
+            EdgeArch`); defaults to the historical 512/2/2/4 Phase-1 capacity.
 
     Returns:
         `{"t_base_ms": float, "t_edge_ms": float, "n_iter": int}`.
@@ -57,12 +63,8 @@ def benchmark(n_warmup: int = 5, n_iter: int = 50, device: Optional[torch.device
 
     batch, num_patches = make_dummy_base_batch(processor)
 
-    proj = Proj_Actiontokens(input_dim=vla.llm_dim, hidden_dim=vla.llm_dim, action_dim=EDGE_OBS_ENCODING_SIZE)
-    proj = proj.to(device=device, dtype=torch.float32)
+    edge, proj = build_edge_and_proj(vla.llm_dim, device, edge_arch)
     proj.eval()
-
-    edge = Edge_adapter_manip(obs_encoding_size=EDGE_OBS_ENCODING_SIZE)
-    edge = edge.to(device=device, dtype=torch.float32)
     edge.eval()
 
     batch_size = batch["input_ids"].shape[0]
@@ -111,7 +113,27 @@ def _print_speedup_table(t_base_ms: float, t_edge_ms: float) -> None:
         print(f"{n:>4}  {per_step:>22.3f}  {speedup:>26.2f}x")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--obs_encoding_size", type=int, default=EdgeArch().obs_encoding_size,
+                         help="Edge adapter token width (Edge_adapter_manip.obs_encoding_size).")
+    parser.add_argument("--heads", type=int, default=EdgeArch().mha_num_attention_heads,
+                         help="Edge adapter MHA attention heads (Edge_adapter_manip.mha_num_attention_heads).")
+    parser.add_argument("--layers", type=int, default=EdgeArch().mha_num_attention_layers,
+                         help="Edge adapter MHA attention layers (Edge_adapter_manip.mha_num_attention_layers).")
+    parser.add_argument("--ff_dim_factor", type=int, default=EdgeArch().mha_ff_dim_factor,
+                         help="Edge adapter MHA feed-forward dim factor (Edge_adapter_manip.mha_ff_dim_factor).")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    result = benchmark()
+    args = _parse_args()
+    edge_arch = EdgeArch(
+        obs_encoding_size=args.obs_encoding_size,
+        mha_num_attention_heads=args.heads,
+        mha_num_attention_layers=args.layers,
+        mha_ff_dim_factor=args.ff_dim_factor,
+    )
+    result = benchmark(edge_arch=edge_arch)
     print(result)
     _print_speedup_table(result["t_base_ms"], result["t_edge_ms"])
